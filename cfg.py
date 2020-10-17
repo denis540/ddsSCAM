@@ -27,4 +27,4 @@ kick_message = ['пошёл нахуй крыса ебаная', 'Докрыси
 
 token = os.environ.get('BOT_TOKEN')
 
-
+bot.run(str(token))
