@@ -143,7 +143,8 @@ class Exchange {
   }
 
   async prepareSymbol(symbol, leverage, marginMode) {
-    if (this.leverageSet.has(symbol)) return;
+    const key = `${symbol}|${leverage}|${marginMode}`; // при зміні плеча/режиму налаштовуємо заново
+    if (this.leverageSet.has(key)) return;
     if (this.client.has.setMarginMode && marginMode) {
       try {
         await this.client.setMarginMode(marginMode, symbol, { leverage });
@@ -158,7 +159,7 @@ class Exchange {
         log.debug(`${this.id} setLeverage ${symbol}: ${e.message}`);
       }
     }
-    this.leverageSet.add(symbol);
+    this.leverageSet.add(key);
   }
 
   async freeBalance() {

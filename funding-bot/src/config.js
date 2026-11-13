@@ -31,6 +31,14 @@ for (const id of exchanges) {
   };
 }
 
+// COIN_QTY=BTC:0.01,ETH:0.2,SOL:5 — кількість монет на вхід для кожної монети
+const coinQty = {};
+for (const pair of list('COIN_QTY')) {
+  const [coin, qty] = pair.split(':').map((x) => x.trim());
+  const q = Number(String(qty).replace(',', '.'));
+  if (coin && q > 0) coinQty[coin.toUpperCase()] = q;
+}
+
 const config = {
   mode,
   exchanges,
@@ -38,7 +46,10 @@ const config = {
   quote: process.env.QUOTE || 'USDT',
 
   // Розмір і ризик
-  positionUsdt: num('POSITION_USDT', 100), // номінал КОЖНОЇ ноги
+  // coins — вхід/вихід фіксованою кількістю монет (COIN_QTY / команда /qty), usdt — сумою POSITION_USDT
+  sizeMode: (process.env.SIZE_MODE || 'coins').toLowerCase(),
+  coinQty,
+  positionUsdt: num('POSITION_USDT', 100), // номінал КОЖНОЇ ноги (для SIZE_MODE=usdt)
   leverage: num('LEVERAGE', 3),
   maxPositions: num('MAX_POSITIONS', 3),
   marginMode: process.env.MARGIN_MODE || 'isolated',
@@ -65,12 +76,21 @@ const config = {
   scanIntervalSec: num('SCAN_INTERVAL_SEC', 60),
   topN: num('TOP_N_LOG', 10),
   stateFile: process.env.STATE_FILE || 'data/state.json',
+  settingsFile: process.env.SETTINGS_FILE || 'data/settings.json',
+  paused: false,
+
+  // Щоденний звіт
+  reportTime: process.env.REPORT_TIME || '23:55',
+  timezone: process.env.TIMEZONE || 'Europe/Kyiv',
 
   telegram: {
     token: process.env.TELEGRAM_BOT_TOKEN,
-    chatId: process.env.TELEGRAM_CHAT_ID,
+    // Хто може керувати ботом і куди йдуть повідомлення (через кому, можна кілька)
+    chatIds: list('TELEGRAM_CHAT_ID'),
   },
 };
+
+if (!['coins', 'usdt'].includes(config.sizeMode)) throw new Error('SIZE_MODE має бути coins або usdt');
 
 if (config.mode === 'live') {
   for (const id of exchanges) {
