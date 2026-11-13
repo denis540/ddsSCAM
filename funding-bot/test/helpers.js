@@ -8,7 +8,9 @@ function fakeClient({ contractSize = 1, step = 0.001, price = 100, rate = 0.0001
     orders: [],
     price,
     rate,
-    has: { fetchFundingRates: true, setLeverage: true, fetchPositions: true },
+    next: Date.now() + 100000,
+    funding: [],
+    has: { fetchFundingRates: true, fetchFundingRate: true, fetchFundingHistory: true, setLeverage: true, fetchPositions: true },
     markets: {
       [sym]: { symbol: sym, swap: true, linear: true, settle: 'USDT', quote: 'USDT', contractSize, taker,
         limits: { amount: { min: step }, cost: { min: 5 } } },
@@ -17,11 +19,15 @@ function fakeClient({ contractSize = 1, step = 0.001, price = 100, rate = 0.0001
     market(s) { return this.markets[s]; },
     amountToPrecision(s, a) { return String(Math.floor(a / step + 1e-9) * step); },
     async fetchFundingRates() {
-      return { [sym]: { symbol: sym, fundingRate: this.rate, interval, markPrice: this.price, nextFundingTimestamp: this.next } };
+      return { [sym]: await this.fetchFundingRate(sym) };
     },
+    async fetchFundingRate() {
+      return { symbol: sym, fundingRate: this.rate, interval, markPrice: this.price, fundingTimestamp: this.next };
+    },
+    async fetchFundingHistory() { return this.funding; },
     async fetchOrderBook() {
       const p = this.price;
-      return { bids: [[p * 0.9999, 1e6]], asks: [[p * 1.0001, 1e6]] };
+      return { bids: [[+(p * 0.9999).toFixed(8), 1e6]], asks: [[+(p * 1.0001).toFixed(8), 1e6]] };
     },
     async createOrder(s, type, side, amount, _p, params) {
       if (this.fail) throw new Error('rejected');

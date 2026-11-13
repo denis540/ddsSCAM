@@ -3,27 +3,37 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { Trader, vwap } = require('../src/trader');
 const { State } = require('../src/state');
-const { findOpportunities } = require('../src/scanner');
+const { planWindows, dueWindows } = require('../src/scanner');
 const { makeExchange } = require('./helpers');
 
-const baseCfg = {
-  mode: 'paper', quote: 'USDT', sizeMode: 'usdt', coinQty: {}, paused: false, positionUsdt: 100, leverage: 3, maxPositions: 3, marginMode: 'isolated',
-  minSpread8h: 0.0005, minExpectedProfitPct: 0.001, holdHoursEstimate: 24, maxEntryBasisPct: 0.0015,
-  maxSlippagePct: 0.001, minMinutesToFunding: 0, maxAbsFundingRate: 0.02, exitSpread8h: 0.0001,
-  maxHoldHours: 72, liqBufferPct: 0.15, whitelist: [], blacklist: [], defaultTakerFee: 0.0005,
-};
 const SYM = 'ETH/USDT:USDT';
+const baseCfg = {
+  mode: 'paper', quote: 'USDT', sizeMode: 'usdt', coinQty: {}, paused: false, positionUsdt: 100, leverage: 3,
+  maxPositions: 3, marginMode: 'isolated', timezone: 'Europe/Kyiv',
+  minFunding: 0.001, minProfit: 0, entryBeforeSec: 120, entryMinSec: 20, maxWindowHours: 8, lookaheadHours: 8,
+  allowEstimated: true, maxEntryBasisPct: 0.0015, maxSlippagePct: 0.001, maxAbsFundingRate: 0.1,
+  exitAfterSec: 120, settleDelaySec: 10, convergePct: 0.0005, earlyExit: true, liqBufferPct: 0.15,
+  whitelist: [], blacklist: [], defaultTakerFee: 0.0005,
+};
 const quiet = async () => {};
 
+/** a = "OKX" (ставка 3%), b = "Binance" (1%, контракт 0.1). Виплата на обох через 100 с. */
 async function setup(cfgOver = {}, aOpts = {}, bOpts = {}) {
   const cfg = { ...baseCfg, ...cfgOver };
-  const a = await makeExchange('a', { rate: 0.001, ...aOpts });
-  const b = await makeExchange('b', { rate: -0.0001, contractSize: 0.1, step: 1, ...bOpts });
-  const ex = { a, b };
+  const T0 = Date.now();
+  const a = await makeExchange('a', { rate: 0.03, ...aOpts });
+  const b = await makeExchange('b', { rate: 0.01, contractSize: 0.1, step: 1, ...bOpts });
+  a.client.next = aOpts.next ?? T0 + 100000;
+  b.client.next = bOpts.next ?? T0 + 100000;
   const state = new State(null, 'Europe/Kyiv');
-  const trader = new Trader(cfg, ex, state, quiet);
+  const msgs = [];
+  const trader = new Trader(cfg, { a, b }, state, async (t) => { msgs.push(t); });
+  let now = T0;
+  trader.now = () => now;
+  const at = (ms) => { now = T0 + ms; };
   const rates = async () => ({ a: await a.fetchFundingRates(), b: await b.fetchFundingRates() });
-  return { cfg, a, b, ex, state, trader, rates };
+  const window = async () => dueWindows(planWindows(await rates(), cfg, undefined, T0), cfg, T0)[0];
+  return { cfg, a, b, state, trader, rates, window, at, msgs, T0 };
 }
 
 test('vwap', () => {
@@ -32,111 +42,160 @@ test('vwap', () => {
   assert.equal(vwap([[10, 20]], 2, 0.1), 10); // 20 контрактів по 0.1 = 2 базових
 });
 
-test('paper: відкриття, фандінг, вихід при падінні спреду', async () => {
-  const { cfg, a, b, state, trader, rates } = await setup();
-  const r = await rates();
-  const [opp] = findOpportunities(r, cfg);
-  assert.ok(await trader.tryOpen(opp));
-  const p = state.positions[0];
-  assert.equal(p.shortEx, 'a');
-  // 100 USDT / 100 = 1 ETH; на b контракт 0.1 => 10 контрактів
-  assert.equal(p.base, 1);
-  assert.equal(p.long.contracts, 10);
+test('повний цикл: вхід за 2 хв, виплата, вихід одразу як ціни зійшлися', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup();
+  const w = await window();
+  assert.ok(w, 'вікно має бути «due» за 100 с до виплати');
+  assert.equal(w.shortEx, 'a');
+  assert.ok(await trader.tryOpen(w));
+  const pos = state.positions[0];
+  assert.equal(pos.base, 1);
+  assert.equal(pos.events.length, 2);
 
-  // імітуємо настання виплати
-  a.client.next = Date.now() - 1; b.client.next = Date.now() - 1;
-  p.short.nextTs = Date.now() - 1; p.long.nextTs = Date.now() - 1;
-  trader.accrueFunding(r); // фіксуємо lastRate
-  assert.ok(p.fundingAccrued > 0);
-  const expected = 0.001 * 100 + 0.0001 * 100; // шорт отримав 0.1, лонг отримав 0.01
-  assert.ok(Math.abs(p.fundingAccrued - expected) < 1e-6, String(p.fundingAccrued));
+  // до виплати ціни розійшлися (немає раннього виходу)
+  a.client.price = 100.5;
+  at(60000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1);
 
-  // спред зник -> закриття
-  a.client.rate = 0.0001; b.client.rate = 0.0001;
+  // виплата пройшла (+10 с затримки), ціни ще не зійшлися — тримаємо
+  at(111000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1);
+  assert.ok(Math.abs(pos.fundingAccrued - (0.03 * 100.5 - 0.01 * 100)) < 1e-9, String(pos.fundingAccrued));
+
+  // ціни зійшлися — вихід, не чекаючи 2 хв
+  a.client.price = 100;
+  at(130000);
   await trader.manage(await rates());
   assert.equal(state.positions.length, 0);
-  const closed = state.data.closed[0];
-  // фандінг 0.11 - комісії 4*0.05%*100=0.2 - спред стакану 0.04 = -0.13 (одна виплата комісій не покриває)
-  assert.ok(Math.abs(closed.pnl - (expected - 0.2 - 0.04)) < 1e-6, String(closed.pnl));
+  assert.match(msgs.at(-1), /ціни зійшлися/);
+  const c = state.data.closed[0];
+  // фандінг 2.015 − комісії 0.2 − спред стакану 0.04
+  assert.ok(Math.abs(c.pnl - (2.015 - 0.2 - 0.04)) < 1e-6, String(c.pnl));
 });
 
-test('не відкриває вдруге той самий символ і поважає maxPositions', async () => {
-  const { cfg, trader, state, rates } = await setup();
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.ok(await trader.tryOpen(opp));
-  assert.equal(await trader.tryOpen(opp), false);
+test('ціни не зійшлися — вихід через exitAfterSec після виплати', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.price = 101;
+  at(150000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1);
+  at(100000 + 121000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /після виплати/);
+});
+
+test('різний час: виплата лише OKX через 100 с, Binance через 1 год — вихід після OKX', async () => {
+  const { T0, state, trader, rates, window, at } = await setup({}, {}, { next: Date.now() + 3600000 });
+  const w = await window();
+  assert.deepEqual(w.events.map((e) => e.ex), ['a']);
+  assert.ok(await trader.tryOpen(w));
+  at(115000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0, 'ціни рівні — вихід одразу після виплати OKX');
+  assert.ok(Math.abs(state.data.closed[0].fundingAccrued - 0.03 * 100) < 1e-9);
+  assert.ok(T0);
+});
+
+test('ставка розвернулась до виплати — вихід', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.rate = -0.01;
+  at(50000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /ставка змінилась/);
+});
+
+test('ранній вихід: ціни зійшлися до виплати і прибуток від цін уже більший за фандінг', async () => {
+  const { cfg, a, state, trader, rates, window, at, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  // До виплати ціна на біржі шорту впала на 3%: різниця цін дає ~+2.86, а фандінг очікується ~+2
+  a.client.price = 97;
+  at(40000);
+  cfg.earlyExit = false;
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'з earlyexit=off чекаємо виплату');
+  cfg.earlyExit = true;
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /ДО виплати/);
+  assert.ok(state.data.closed[0].pnl > 2.5);
+});
+
+test('свіжа ставка перед входом впала нижче порогу — пропуск', async () => {
+  const { a, trader, window, state } = await setup();
+  const w = await window();
+  a.client.rate = 0.0101; // фандінг 0.01% < 0.1%
+  assert.equal(await trader.tryOpen(w), false);
+  assert.equal(state.positions.length, 0);
+});
+
+test('не відкриває вдруге той самий символ, поважає maxPositions і паузу', async () => {
+  const { cfg, trader, state, window } = await setup();
+  const w = await window();
+  cfg.paused = true;
+  assert.equal(await trader.tryOpen(w), false);
+  cfg.paused = false;
+  assert.ok(await trader.tryOpen(w));
+  assert.equal(await trader.tryOpen(w), false);
   assert.equal(state.positions.length, 1);
 });
 
 test('live: якщо одна нога впала — інша відкочується reduceOnly', async () => {
-  const { cfg, a, b, trader, state, rates } = await setup({ mode: 'live' });
+  const { a, b, trader, state, window } = await setup({ mode: 'live' });
   b.client.fail = true;
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.equal(await trader.tryOpen(opp), false);
+  assert.equal(await trader.tryOpen(await window()), false);
   assert.equal(state.positions.length, 0);
-  assert.equal(a.client.orders.length, 2);
-  assert.equal(a.client.orders[0].side, 'sell');
-  assert.equal(a.client.orders[1].side, 'buy');
-  assert.equal(a.client.orders[1].params.reduceOnly, true);
+  assert.deepEqual(a.client.orders.map((o) => [o.side, !!o.params.reduceOnly]), [['sell', false], ['buy', true]]);
 });
 
-test('live: відкриття і закриття ставить правильні ордери', async () => {
-  const { cfg, a, b, trader, state, rates } = await setup({ mode: 'live', maxHoldHours: 0 });
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.ok(await trader.tryOpen(opp));
-  assert.deepEqual(a.client.orders.map((o) => o.side), ['sell']);
-  assert.deepEqual(b.client.orders.map((o) => [o.side, o.amount]), [['buy', 10]]);
-  // fetchPositions порожній -> трактуємо як зниклу позицію, але maxHoldHours=0 спрацює раніше
-  await trader.manage(await rates());
-  assert.equal(state.positions.length, 0);
-  assert.equal(a.client.orders[1].side, 'buy');
-  assert.equal(b.client.orders[1].side, 'sell');
-  assert.ok(b.client.orders[1].params.reduceOnly);
-});
-
-test('режим монет: вхід і вихід рівно заданою кількістю', async () => {
-  const { cfg, a, b, trader, state, rates } = await setup({ mode: 'live', sizeMode: 'coins', coinQty: { ETH: 2.5 }, maxHoldHours: 0 });
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.ok(await trader.tryOpen(opp));
+test('live, режим монет: вхід і вихід рівно заданою кількістю, фандінг з історії біржі', async () => {
+  const { a, b, trader, state, rates, window, at, msgs } = await setup({ mode: 'live', sizeMode: 'coins', coinQty: { ETH: 2.5 } });
+  assert.ok(await trader.tryOpen(await window()));
   assert.equal(state.positions[0].base, 2.5);
-  assert.deepEqual(a.client.orders.map((o) => o.amount), [2.5]);   // contractSize 1
-  assert.deepEqual(b.client.orders.map((o) => o.amount), [25]);    // contractSize 0.1 => 25 контрактів
+  assert.deepEqual(a.client.orders.map((o) => o.amount), [2.5]);
+  assert.deepEqual(b.client.orders.map((o) => o.amount), [25]); // контракт 0.1
+  const T = Date.now();
+  a.client.funding = [{ symbol: SYM, timestamp: T + 100000, amount: 7.4 }];
+  b.client.funding = [{ symbol: SYM, timestamp: T + 100000, amount: -2.5 }];
+  at(115000);
   await trader.manage(await rates());
-  assert.deepEqual(a.client.orders.map((o) => o.amount), [2.5, 2.5]);
-  assert.deepEqual(b.client.orders.map((o) => o.amount), [25, 25]);
-  assert.equal(state.data.daily[state.dayKey()].closed, 1);
+  assert.equal(state.positions.length, 0);
+  assert.deepEqual(a.client.orders.map((o) => [o.side, o.amount]), [['sell', 2.5], ['buy', 2.5]]);
+  assert.deepEqual(b.client.orders.map((o) => [o.side, o.amount]), [['buy', 25], ['sell', 25]]);
+  assert.ok(Math.abs(state.data.closed[0].fundingAccrued - 4.9) < 1e-9);
+  assert.match(msgs.at(-1), /факт з бірж/);
 });
 
 test('режим монет: пропуск, якщо кількість не задана або не кратна лоту', async () => {
-  const { cfg, trader, state, rates } = await setup({ sizeMode: 'coins', coinQty: {} });
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.equal(await trader.tryOpen(opp), false);
-  cfg.coinQty.ETH = 2.55; // на біржі b крок 0.1 ETH => 2.5, округлення > 1%
-  assert.equal(await trader.tryOpen(opp), false);
+  const { cfg, trader, window, state } = await setup({ sizeMode: 'coins', coinQty: {} });
+  const w = await window();
+  assert.equal(await trader.tryOpen(w), false);
+  trader.skipped.clear();
+  cfg.coinQty.ETH = 2.55; // на біржі b крок 0.1 ETH
+  assert.equal(await trader.tryOpen(w), false);
+  trader.skipped.clear();
   cfg.coinQty.ETH = 2.6;
-  assert.ok(await trader.tryOpen(opp));
+  assert.ok(await trader.tryOpen(w));
   assert.equal(state.positions[0].base, 2.6);
 });
 
-test('пауза і maxPositions = 0 блокують вхід', async () => {
-  const { cfg, trader, rates } = await setup({ paused: true });
-  const [opp] = findOpportunities(await rates(), cfg);
-  assert.equal(await trader.tryOpen(opp), false);
-  cfg.paused = false; cfg.maxPositions = 0;
-  assert.equal(await trader.tryOpen(opp), false);
-});
-
-test('сповіщення містять ордери і PnL', async () => {
-  const msgs = [];
-  const { cfg, trader, rates } = await setup({ maxHoldHours: 0 });
-  trader.notify = async (t) => { msgs.push(t); };
-  const [opp] = findOpportunities(await rates(), cfg);
-  await trader.tryOpen(opp);
+test('сповіщення: ордери, виплати, PnL угоди і загальний', async () => {
+  const { trader, rates, window, at, msgs } = await setup();
+  await trader.tryOpen(await window());
+  at(115000);
   await trader.manage(await rates());
-  assert.match(msgs[0], /ВІДКРИТО ETH/);
+  assert.match(msgs[0], /ВХІД ETH/);
   assert.match(msgs[0], /SELL 1 ETH @ 99\.99 на a/);
   assert.match(msgs[0], /BUY 1 ETH \(10 контр\.\) @ 100\.01 на b/);
-  assert.match(msgs[1], /ЗАКРИТО/);
-  assert.match(msgs[1], /PnL угоди: -0\.24/);
-  assert.match(msgs[1], /Загальний PnL: -0\.24/);
+  assert.match(msgs[0], /a SHORT: ставка 3\.0000%/);
+  assert.match(msgs[0], /Очікуваний фандінг: \+2%/);
+  assert.match(msgs[1], /ВИХІД/);
+  assert.match(msgs[1], /Отримані виплати/);
+  assert.match(msgs[1], /PnL угоди: \+1\.76/);
+  assert.match(msgs[1], /Загальний PnL: \+1\.76/);
 });

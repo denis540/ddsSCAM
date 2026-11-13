@@ -1,5 +1,8 @@
 'use strict';
 
+const { clock, duration } = require('./time');
+const { contrib } = require('./scanner');
+
 const pct = (x, d = 3) => (Number.isFinite(x) ? `${(x * 100).toFixed(d)}%` : '—');
 const fmt = (x, d = 4) => (Number.isFinite(x) ? (+x.toFixed(d)).toString() : '—');
 const sign = (x, d = 4) => (Number.isFinite(x) ? `${x >= 0 ? '+' : ''}${fmt(x, d)}` : '—');
@@ -12,41 +15,51 @@ function unrealized(pos, rates) {
   return { price, total: (price ?? 0) + pos.fundingAccrued - pos.feesPaid, hasPrice: price !== undefined };
 }
 
-function currentSpread8h(pos, rates) {
-  const s = rates?.[pos.shortEx]?.[pos.symbol];
-  const l = rates?.[pos.longEx]?.[pos.symbol];
-  if (!s || !l) return undefined;
-  return (s.rate / (s.intervalH || 8) - l.rate / (l.intervalH || 8)) * 8;
-}
-
-function formatPosition(pos, rates, i, quote) {
+function formatPosition(pos, rates, i, cfg) {
   const u = unrealized(pos, rates);
-  const heldH = (Date.now() - pos.openedAt) / 3600000;
+  const now = Date.now();
+  const tz = cfg.timezone;
+  const events = (pos.events || [])
+    .map((e) => {
+      const st = e.paid ? `✅ ${sign(e.amount)}` : `⏳ через ${duration(e.ts - now)}`;
+      return `   ${clock(e.ts, tz)} ${e.ex} ${e.side.toUpperCase()} ${pct(e.rate, 4)}${e.est && !e.paid ? '≈' : ''} → ${sign(contrib(e) * 100, 4)}% ${st}`;
+    })
+    .join('\n');
+  const exitTxt = pos.exitAt ? (pos.exitAt > now ? `вихід ~${clock(pos.exitAt, tz)} (через ${duration(pos.exitAt - now)}) або при сходженні цін` : 'виходимо…') : '';
   return (
     `${i}. ${pos.symbol} — ${fmt(pos.base, 8)} ${pos.symbol.split('/')[0]}, x${pos.leverage || '?'}\n` +
     `   SHORT ${pos.shortEx} @ ${fmt(pos.short.entry, 8)} | LONG ${pos.longEx} @ ${fmt(pos.long.entry, 8)}\n` +
-    `   Спред: вхід ${pct(pos.entrySpread8h)} → зараз ${pct(currentSpread8h(pos, rates))} /8h | ${heldH.toFixed(1)} год\n` +
-    `   Фандінг ${sign(pos.fundingAccrued)}, комісії −${fmt(pos.feesPaid)}, ціна ${sign(u.price)}\n` +
-    `   Нереаліз. PnL: ${sign(u.total)} ${quote}` +
+    `${events}\n` +
+    `   Фандінг ${sign(pos.fundingAccrued)} (очік. ${sign((pos.expectedFunding || 0) * 100, 4)}%), комісії −${fmt(pos.feesPaid)}, ціна ${sign(u.price)}\n` +
+    `   Нереаліз. PnL: ${sign(u.total)} ${cfg.quote}\n   ${exitTxt}` +
     (pos.closeError ? '\n   ⚠️ закрита не повністю!' : '')
   );
 }
 
-function formatPositions(state, rates, quote) {
+function formatPositions(state, rates, cfg) {
   if (!state.positions.length) return 'Відкритих позицій немає';
-  return state.positions.map((p, i) => formatPosition(p, rates, i + 1, quote)).join('\n\n');
+  return state.positions.map((p, i) => formatPosition(p, rates, i + 1, cfg)).join('\n\n');
 }
 
-function formatOpps(opps, n = 10) {
-  if (!opps || !opps.length) return 'Можливостей, що проходять фільтри, зараз немає';
-  return opps
-    .slice(0, n)
-    .map(
-      (o, i) =>
-        `${i + 1}. ${o.symbol}: SHORT ${o.shortEx} ${pct(o.shortRate, 4)}/${o.shortIntervalH}h | LONG ${o.longEx} ${pct(o.longRate, 4)}/${o.longIntervalH}h\n` +
-        `   спред ${pct(o.spread8h)}/8h, APR ${pct(o.apr, 1)}, чистий за горизонт ${pct(o.expectedProfit)}`
-    )
-    .join('\n');
+function formatOpps(wins, cfg, n = 10) {
+  if (!wins || !wins.length) return 'Вікон фандінгу, що проходять фільтри, зараз немає';
+  const now = Date.now();
+  const tz = cfg.timezone;
+  return (
+    `Найкращі вікна (вхід за ${cfg.entryBeforeSec} с до першої виплати):\n\n` +
+    wins
+      .slice(0, n)
+      .map((w, i) => {
+        const ev = w.events
+          .map((e) => `   ${clock(e.ts, tz)} ${e.ex} ${e.side.toUpperCase()} ${pct(e.rate, 4)}${e.est ? '≈' : ''} → ${sign(contrib(e) * 100, 4)}%`)
+          .join('\n');
+        return (
+          `${i + 1}. ${w.symbol}: SHORT ${w.shortEx} / LONG ${w.longEx}, старт через ${duration(w.startTs - now)}\n${ev}\n` +
+          `   фандінг ${pct(w.funding)}${w.estimated ? ' (частково оцінка)' : ''}, комісії ${pct(w.fees)}, чистий ${pct(w.net)}`
+        );
+      })
+      .join('\n\n')
+  );
 }
 
 function formatStatus(cfg, state, rates, lastScanAt) {
@@ -57,7 +70,8 @@ function formatStatus(cfg, state, rates, lastScanAt) {
     `🤖 Режим: ${cfg.mode.toUpperCase()}${cfg.paused ? ' — ⏸ ПАУЗА (нові входи вимкнено)' : ''}\n` +
     `Біржі: ${cfg.exchanges.join(', ')}\n` +
     `Розмір: ${cfg.sizeMode === 'coins' ? `монети (${Object.keys(cfg.coinQty).length} налаштовано, /qty)` : `${cfg.positionUsdt} ${cfg.quote}`}, плече x${cfg.leverage}\n` +
-    `Поріг входу: спред > ${pct(cfg.minSpread8h)}/8h\n` +
+    `Поріг: фандінг > ${pct(cfg.minFunding)}, чистий > ${pct(cfg.minProfit)}\n` +
+    `Вхід за ${cfg.entryBeforeSec} с до виплати, вихід через ${cfg.exitAfterSec} с після / при сходженні (≤${pct(cfg.convergePct)})\n` +
     `Позиції: ${state.positions.length}/${cfg.maxPositions}, нереаліз. PnL ${sign(openU)} ${cfg.quote}\n\n` +
     `Сьогодні: PnL ${sign(today.pnl)}, фандінг ${sign(today.funding)}, угод закрито ${today.closed}\n` +
     `Всього: PnL ${sign(s.realizedPnl)} ${cfg.quote}, угод ${s.trades} (прибуткових ${s.wins})\n` +

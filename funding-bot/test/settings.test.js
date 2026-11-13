@@ -8,15 +8,18 @@ const { Settings } = require('../src/settings');
 const { Telegram } = require('../src/telegram');
 const { State } = require('../src/state');
 
-const mkCfg = () => ({ minSpread8h: 0.0005, leverage: 3, maxPositions: 3, sizeMode: 'coins', coinQty: {}, positionUsdt: 100,
+const mkCfg = () => ({ minFunding: 0.001, entryBeforeSec: 120, exitAfterSec: 120, convergePct: 0.0005, earlyExit: true, minProfit: 0.0005, timezone: 'Europe/Kyiv', leverage: 3, maxPositions: 3, sizeMode: 'coins', coinQty: {}, positionUsdt: 100,
   whitelist: [], blacklist: [], reportTime: '23:55', paused: false, marginMode: 'isolated' });
 
 test('settings: зміна, валідація, збереження і відновлення', () => {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-')), 's.json');
   const cfg = mkCfg();
   const s = new Settings(cfg, file);
-  assert.equal(s.set('minspread', '0,1'), '0.1%');
-  assert.equal(cfg.minSpread8h, 0.001);
+  assert.equal(s.set('minfunding', '0,5'), '0.5%');
+  assert.equal(cfg.minFunding, 0.005);
+  s.set('entrybefore', '90');
+  s.set('earlyexit', 'off');
+  assert.throws(() => s.set('earlyexit', 'maybe'), /on або off/);
   s.set('leverage', '5');
   s.set('maxpos', '7');
   s.set('whitelist', 'btc,eth');
@@ -29,7 +32,9 @@ test('settings: зміна, валідація, збереження і відн
 
   const cfg2 = mkCfg();
   new Settings(cfg2, file);
-  assert.equal(cfg2.minSpread8h, 0.001);
+  assert.equal(cfg2.minFunding, 0.005);
+  assert.equal(cfg2.entryBeforeSec, 90);
+  assert.equal(cfg2.earlyExit, false);
   assert.equal(cfg2.leverage, 5);
   assert.equal(cfg2.maxPositions, 7);
   assert.deepEqual(cfg2.whitelist, ['BTC', 'ETH']);
@@ -46,8 +51,10 @@ test('telegram: команди змінюють налаштування', async
   tg.send = async (t) => { sent.push(t); };
   tg.ctx = { cfg, settings, state, trader: {}, getRates: () => ({}), getOpps: () => [], getLastScanAt: () => undefined };
 
-  await tg.handle('/set minspread 0.2', '42');
-  assert.equal(cfg.minSpread8h, 0.002);
+  await tg.handle('/set minfunding 2', '42');
+  assert.equal(cfg.minFunding, 0.02);
+  await tg.handle('/set exitafter 60', '42');
+  assert.equal(cfg.exitAfterSec, 60);
   await tg.handle('/qty SOL 5', '42');
   assert.equal(cfg.coinQty.SOL, 5);
   await tg.handle('⏸ Пауза', '42');
@@ -57,7 +64,7 @@ test('telegram: команди змінюють налаштування', async
   await tg.handle('💰 Звіт', '42');
   assert.match(sent.at(-1), /ЗАГАЛЬНИЙ PnL/);
   await tg.handle('/settings', '42');
-  assert.match(sent.at(-1), /minspread = 0.2%/);
+  assert.match(sent.at(-1), /minfunding = 2%/);
 });
 
 test('telegram: повідомлення з чужого чату ігноруються', async () => {

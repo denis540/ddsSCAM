@@ -8,21 +8,25 @@ const path = require('path');
  * type pct — користувач вводить у відсотках (0.1 = 0.1%), у cfg зберігається частка (0.001).
  */
 const SCHEMA = {
-  minspread: { field: 'minSpread8h', type: 'pct', min: 0, desc: 'Мін. різниця фандінгу для входу, % за 8 год' },
-  minprofit: { field: 'minExpectedProfitPct', type: 'pct', desc: 'Мін. очікуваний чистий профіт за holdhours, %' },
-  exitspread: { field: 'exitSpread8h', type: 'pct', desc: 'Вихід, коли спред впав нижче, % за 8 год' },
+  minfunding: { field: 'minFunding', type: 'pct', min: 0, desc: 'Вхід, лише якщо фандінг за виплату(и) більший за, % (напр. OKX 3% − Binance 1% = 2%)' },
+  minprofit: { field: 'minProfit', type: 'pct', desc: 'Мін. чистий профіт після 4 комісій, %' },
+  entrybefore: { field: 'entryBeforeSec', type: 'int', min: 10, max: 3600, desc: 'Заходити за N секунд до виплати' },
+  entrymin: { field: 'entryMinSec', type: 'int', min: 3, max: 600, desc: 'Не заходити, якщо до виплати менше N секунд' },
+  exitafter: { field: 'exitAfterSec', type: 'int', min: 0, max: 3600, desc: 'Виходити через N секунд після виплати' },
+  converge: { field: 'convergePct', type: 'pct', min: 0, desc: 'Ціни зійшлися, якщо різниця між біржами ≤ %' },
+  earlyexit: { field: 'earlyExit', type: 'bool', desc: 'Вийти ДО виплати, якщо прибуток від цін уже більший за фандінг (on/off)' },
+  maxwindow: { field: 'maxWindowHours', type: 'num', min: 0, max: 24, desc: 'Макс. годин між першою і останньою виплатою у вікні (0 = лише одночасні/одна виплата)' },
+  estimated: { field: 'allowEstimated', type: 'bool', desc: 'Враховувати наступні виплати за поточною ставкою (on/off)' },
   sizemode: { field: 'sizeMode', type: 'enum', values: ['coins', 'usdt'], desc: 'Розмір входу: coins (кількість монет) або usdt' },
   usdt: { field: 'positionUsdt', type: 'num', min: 1, desc: 'Сума входу на кожну ногу, USDT (для sizemode=usdt)' },
   leverage: { field: 'leverage', type: 'int', min: 1, max: 125, desc: 'Плече для нових позицій' },
   marginmode: { field: 'marginMode', type: 'enum', values: ['isolated', 'cross'], desc: 'Режим маржі' },
   maxpos: { field: 'maxPositions', type: 'int', min: 0, max: 100, desc: 'Макс. одночасно відкритих пар' },
-  holdhours: { field: 'holdHoursEstimate', type: 'num', min: 1, desc: 'Горизонт окупності входу, год' },
-  maxhold: { field: 'maxHoldHours', type: 'num', min: 1, desc: 'Примусовий вихід через N год' },
-  basis: { field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами, %' },
+  basis: { field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами на вході, %' },
   slippage: { field: 'maxSlippagePct', type: 'pct', min: 0, desc: 'Макс. слипедж по стакану, %' },
   liqbuffer: { field: 'liqBufferPct', type: 'pct', min: 1, max: 90, desc: 'Закрити, якщо до ліквідації менше, %' },
-  maxrate: { field: 'maxAbsFundingRate', type: 'pct', min: 0, desc: 'Ігнорувати ставки фандінгу більші за, %' },
-  interval: { field: 'scanIntervalSec', type: 'int', min: 10, desc: 'Інтервал сканування, сек' },
+  maxrate: { field: 'maxAbsFundingRate', type: 'pct', min: 0, desc: 'Ігнорувати ставки фандінгу більші за, % (аномалії)' },
+  interval: { field: 'scanIntervalSec', type: 'int', min: 10, desc: 'Інтервал оновлення ставок, сек' },
   reporttime: { field: 'reportTime', type: 'time', desc: 'Час щоденного звіту, HH:MM' },
   whitelist: { field: 'whitelist', type: 'list', desc: 'Тільки ці монети (через кому, "-" = усі)' },
   blacklist: { field: 'blacklist', type: 'list', desc: 'Ніколи не торгувати ці монети ("-" = очистити)' },
@@ -44,6 +48,10 @@ function parse(def, raw) {
     case 'enum':
       if (!def.values.includes(s.toLowerCase())) throw new Error(`допустимо: ${def.values.join(', ')}`);
       return s.toLowerCase();
+    case 'bool':
+      if (['on', '1', 'true', 'yes', 'так'].includes(s.toLowerCase())) return true;
+      if (['off', '0', 'false', 'no', 'ні'].includes(s.toLowerCase())) return false;
+      throw new Error('on або off');
     case 'time':
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(s)) throw new Error('формат HH:MM, напр. 23:55');
       return s;
@@ -58,6 +66,7 @@ function parse(def, raw) {
 function display(def, v) {
   if (def.type === 'pct') return `${+(v * 100).toFixed(6)}%`;
   if (def.type === 'list') return v.length ? v.join(',') : '—';
+  if (def.type === 'bool') return v ? 'on' : 'off';
   return String(v);
 }
 

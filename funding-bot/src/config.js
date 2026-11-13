@@ -15,6 +15,12 @@ const list = (name, def = []) => {
   return v.split(',').map((s) => s.trim()).filter(Boolean);
 };
 
+const bool = (name, def) => {
+  const v = process.env[name];
+  if (v === undefined || v === '') return def;
+  return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
+};
+
 const mode = (process.env.MODE || 'paper').toLowerCase();
 if (!['paper', 'live'].includes(mode)) throw new Error('MODE має бути paper або live');
 
@@ -54,18 +60,23 @@ const config = {
   maxPositions: num('MAX_POSITIONS', 3),
   marginMode: process.env.MARGIN_MODE || 'isolated',
 
-  // Вхід
-  minSpread8h: num('MIN_SPREAD_8H_PCT', 0.05) / 100, // різниця фандінгу, нормалізована до 8 год
-  minExpectedProfitPct: num('MIN_EXPECTED_PROFIT_PCT', 0.1) / 100, // чистий профіт за HOLD_HOURS_ESTIMATE після комісій
-  holdHoursEstimate: num('HOLD_HOURS_ESTIMATE', 24),
+  // Вхід — під конкретну виплату фандінгу
+  minFunding: num('MIN_FUNDING_PCT', 0.1) / 100, // мін. сумарний фандінг за вікно (різниця ставок), %
+  minProfit: num('MIN_PROFIT_PCT', 0.05) / 100, // мін. чистий профіт за вікно після 4 комісій, %
+  entryBeforeSec: num('ENTRY_BEFORE_SEC', 120), // заходимо приблизно за стільки секунд до виплати
+  entryMinSec: num('ENTRY_MIN_SEC', 20), // пізніше цього вже не заходимо (ризик не встигнути)
+  maxWindowHours: num('MAX_WINDOW_HOURS', 8), // макс. тривалість вікна між першою і останньою виплатою
+  lookaheadHours: num('LOOKAHEAD_HOURS', 8), // на скільки годин уперед показувати можливості (/top)
+  allowEstimated: bool('ALLOW_ESTIMATED', true), // враховувати наступні виплати за поточною ставкою
   maxEntryBasisPct: num('MAX_ENTRY_BASIS_PCT', 0.15) / 100, // макс. несприятлива різниця цін між біржами
   maxSlippagePct: num('MAX_SLIPPAGE_PCT', 0.1) / 100,
-  minMinutesToFunding: num('MIN_MINUTES_TO_FUNDING', 0), // 0 = входимо будь-коли
-  maxAbsFundingRate: num('MAX_ABS_FUNDING_RATE_PCT', 2) / 100, // відсікаємо аномалії
+  maxAbsFundingRate: num('MAX_ABS_FUNDING_RATE_PCT', 10) / 100, // відсікаємо явні аномалії
 
   // Вихід
-  exitSpread8h: num('EXIT_SPREAD_8H_PCT', 0.01) / 100,
-  maxHoldHours: num('MAX_HOLD_HOURS', 72),
+  exitAfterSec: num('EXIT_AFTER_SEC', 120), // вихід приблизно через стільки секунд після останньої виплати
+  settleDelaySec: num('SETTLE_DELAY_SEC', 10), // раніше цього після виплати не закриваємось (щоб біржа точно нарахувала)
+  convergePct: num('CONVERGE_PCT', 0.05) / 100, // ціни «зійшлися», якщо різниця між біржами ≤ X%
+  earlyExit: bool('EARLY_EXIT', true), // вийти ще ДО виплати, якщо прибуток від цін уже більший за очікуваний фандінг
   liqBufferPct: num('LIQ_BUFFER_PCT', 15) / 100, // закриваємо пару, якщо до ліквідації менше X%
 
   // Фільтри
@@ -73,7 +84,8 @@ const config = {
   blacklist: list('BLACKLIST'),
   defaultTakerFee: num('DEFAULT_TAKER_FEE_PCT', 0.05) / 100,
 
-  scanIntervalSec: num('SCAN_INTERVAL_SEC', 60),
+  scanIntervalSec: num('SCAN_INTERVAL_SEC', 30), // як часто оновлювати ставки всіх бірж
+  tickSec: num('TICK_SEC', 5), // як часто перевіряти таймінги входу/виходу
   topN: num('TOP_N_LOG', 10),
   stateFile: process.env.STATE_FILE || 'data/state.json',
   settingsFile: process.env.SETTINGS_FILE || 'data/settings.json',

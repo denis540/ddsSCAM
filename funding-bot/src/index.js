@@ -10,13 +10,13 @@ try {
   process.exit(1);
 }
 const { Exchange } = require('./exchange');
-const { findOpportunities } = require('./scanner');
+const { planWindows, dueWindows } = require('./scanner');
 const { Trader } = require('./trader');
 const { State } = require('./state');
 const { Settings } = require('./settings');
 const { Telegram } = require('./telegram');
 const { formatDailyReport } = require('./report');
-const { nowParts } = require('./time');
+const { nowParts, clock, duration } = require('./time');
 
 const scanOnly = process.argv.includes('--scan-only');
 const pct = (x, d = 3) => `${(x * 100).toFixed(d)}%`;
@@ -37,20 +37,21 @@ async function fetchAllRates(exchanges) {
   return Object.fromEntries(entries);
 }
 
-function printTable(opps, n) {
-  if (!opps.length) {
-    log.info('Можливостей, що проходять фільтри, немає');
+function printTable(wins, n) {
+  if (!wins.length) {
+    log.info('Вікон фандінгу, що проходять фільтри, немає');
     return;
   }
+  const now = Date.now();
   console.table(
-    opps.slice(0, n).map((o) => ({
-      symbol: o.symbol,
-      short: `${o.shortEx} ${pct(o.shortRate, 4)}/${o.shortIntervalH}h`,
-      long: `${o.longEx} ${pct(o.longRate, 4)}/${o.longIntervalH}h`,
-      'spread/8h': pct(o.spread8h),
-      APR: pct(o.apr, 1),
-      basis: pct(o.basis),
-      'net est.': pct(o.expectedProfit),
+    wins.slice(0, n).map((w) => ({
+      symbol: w.symbol,
+      short: `${w.shortEx} ${pct(w.shortRate, 4)}/${w.shortIntervalH}h`,
+      long: `${w.longEx} ${pct(w.longRate, 4)}/${w.longIntervalH}h`,
+      'виплата': `${clock(w.startTs, cfg.timezone)}${w.endTs !== w.startTs ? `–${clock(w.endTs, cfg.timezone)}` : ''}`,
+      'до старту': duration(w.startTs - now),
+      'фандінг': pct(w.funding) + (w.estimated ? '≈' : ''),
+      'чистий': pct(w.net),
     }))
   );
 }
@@ -89,7 +90,7 @@ async function main() {
   const takerFee = (exId, symbol) => exchanges[exId].takerFee(symbol);
 
   let lastRates = {};
-  let lastOpps = [];
+  let lastWindows = [];
   let lastScanAt;
 
   // Не шлемо звіт одразу після старту, якщо сьогоднішній час звіту вже минув
@@ -102,7 +103,7 @@ async function main() {
     await tg.start({
       cfg, settings, state, trader,
       getRates: () => lastRates,
-      getOpps: () => lastOpps,
+      getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
     });
     const qtyInfo =
@@ -115,7 +116,8 @@ async function main() {
       `🚀 Бот запущено (${cfg.mode.toUpperCase()})${cfg.paused ? ' — ⏸ на паузі' : ''}\n` +
         `Біржі: ${Object.keys(exchanges).join(', ')}\n` +
         `Вхід: ${qtyInfo}, плече x${cfg.leverage}, макс. пар ${cfg.maxPositions}\n` +
-        `Поріг: спред > ${pct(cfg.minSpread8h)}/8h\n` +
+        `Поріг: фандінг > ${pct(cfg.minFunding)}, чистий > ${pct(cfg.minProfit)}\n` +
+        `Вхід за ${cfg.entryBeforeSec} с до виплати, вихід через ${cfg.exitAfterSec} с після або при сходженні цін\n` +
         `Відкритих позицій: ${state.positions.length}\n/help — команди`
     );
   }
@@ -130,36 +132,44 @@ async function main() {
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
 
+  const scan = async () => {
+    const rates = await fetchAllRates(exchanges);
+    let wins = planWindows(rates, cfg, takerFee);
+    // У режимі монет торгуємо лише ті монети, для яких задано кількість
+    if (cfg.sizeMode === 'coins') wins = wins.filter((w) => cfg.coinQty[coinOf(w.symbol)] > 0);
+    lastRates = rates;
+    lastWindows = wins;
+    lastScanAt = Date.now();
+    printTable(wins, cfg.topN);
+  };
+
+  let nextScan = 0;
   while (!stopping) {
     const started = Date.now();
     try {
-      const rates = await fetchAllRates(exchanges);
-      let opps = findOpportunities(rates, cfg, takerFee);
-      // У режимі монет торгуємо лише ті монети, для яких задано кількість
-      if (cfg.sizeMode === 'coins') opps = opps.filter((o) => cfg.coinQty[coinOf(o.symbol)] > 0);
-      lastRates = rates;
-      lastOpps = opps;
-      lastScanAt = Date.now();
-      printTable(opps, cfg.topN);
-
+      if (started >= nextScan) {
+        nextScan = started + cfg.scanIntervalSec * 1000;
+        await scan();
+      }
       if (!scanOnly) {
         await trader.withLock(async () => {
-          trader.accrueFunding(rates);
-          await trader.manage(rates);
+          await trader.manage(lastRates);
           if (!cfg.paused) {
-            for (const opp of opps) {
+            // Вікна, до першої виплати яких лишилось ~entryBeforeSec. Найприбутковіші — першими.
+            const due = dueWindows(lastWindows, cfg).sort((a, b) => b.net - a.net);
+            for (const w of due) {
               if (state.positions.length >= cfg.maxPositions) break;
-              await trader.tryOpen(opp);
+              await trader.tryOpen(w);
             }
           }
         });
-        await maybeDailyReport(state, tg, rates);
+        await maybeDailyReport(state, tg, lastRates);
       }
     } catch (e) {
       log.error('Помилка циклу:', e.message);
     }
-    const wait = cfg.scanIntervalSec * 1000 - (Date.now() - started);
-    for (let t = 0; t < wait && !stopping; t += 500) await sleep(500);
+    const wait = (scanOnly ? cfg.scanIntervalSec : cfg.tickSec) * 1000 - (Date.now() - started);
+    for (let t = 0; t < wait && !stopping; t += 250) await sleep(Math.min(250, wait - t));
   }
   if (!scanOnly) await notify(`🛑 Бот зупинено. Відкритих позицій: ${state.positions.length} (залишаються на біржах)`);
 }

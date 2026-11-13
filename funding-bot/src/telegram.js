@@ -27,7 +27,7 @@ const BUTTONS = {
 const HELP = `Команди:
 /status — стан бота і прибуток
 /positions — відкриті позиції з PnL
-/top — найкращі можливості зараз
+/top — найближчі вигідні виплати фандінгу
 /report — звіт за сьогодні (автоматично щодня о reporttime)
 /history — останні закриті угоди
 /settings — усі налаштування
@@ -39,8 +39,17 @@ const HELP = `Команди:
 /pause — не відкривати нові позиції (відкриті супроводжуються)
 /resume — відновити входи
 
+Як працює: бот заходить за ~2 хв до виплати фандінгу (SHORT там, де ставка вища,
+LONG там, де нижча), отримує виплату(и) і виходить через ~2 хв після
+або одразу, як ціни на біржах зійдуться.
+
 Приклади:
-/set minspread 0.1   — входити тільки якщо спред фандінгу > 0.1% за 8 год
+/set minfunding 0.5  — входити, лише якщо фандінг за виплату > 0.5% (напр. OKX 3% − Binance 1% = 2%)
+/set minprofit 0.2   — і чистий профіт після комісій > 0.2%
+/set entrybefore 120 — заходити за 120 с до виплати
+/set exitafter 120   — виходити через 120 с після виплати
+/set converge 0.05   — ціни «зійшлись», якщо різниця ≤ 0.05%
+/set maxwindow 0     — лише одна виплата (або одночасні), без утримання між різними часами
 /set maxpos 5        — макс. 5 пар одночасно
 /set leverage 3      — плече x3 для нових позицій
 /set sizemode coins  — вхід кількістю монет (/qty)
@@ -151,9 +160,9 @@ class Telegram {
       case '/status':
         return reply(R.formatStatus(cfg, state, this.ctx.getRates(), this.ctx.getLastScanAt()));
       case '/positions':
-        return reply(R.formatPositions(state, this.ctx.getRates(), cfg.quote));
+        return reply(R.formatPositions(state, this.ctx.getRates(), cfg));
       case '/top':
-        return reply(R.formatOpps(this.ctx.getOpps(), 10));
+        return reply(R.formatOpps(this.ctx.getOpps(), cfg, 10));
       case '/report':
         return reply(R.formatDailyReport(cfg, state, state.dayKey(), this.ctx.getRates()));
       case '/history':

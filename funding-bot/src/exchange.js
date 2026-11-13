@@ -107,15 +107,37 @@ class Exchange {
     const out = {};
     for (const [sym, fr] of Object.entries(raw)) {
       const s = fr.symbol || sym;
-      if (!allowed.has(s) || !Number.isFinite(fr.fundingRate)) continue;
-      out[s] = {
-        rate: fr.fundingRate,
-        intervalH: parseIntervalHours({ ...fr, symbol: s }, this.intervals),
-        nextTs: fr.nextFundingTimestamp || fr.fundingTimestamp,
-        mark: fr.markPrice || fr.indexPrice,
-      };
+      if (!allowed.has(s)) continue;
+      const n = this.normalizeRate(fr, s);
+      if (n) out[s] = n;
     }
     return out;
+  }
+
+  normalizeRate(fr, symbol) {
+    if (!fr || !Number.isFinite(fr.fundingRate)) return undefined;
+    return {
+      rate: fr.fundingRate,
+      intervalH: parseIntervalHours({ ...fr, symbol }, this.intervals),
+      // У ccxt fundingTimestamp — час НАЙБЛИЖЧОЇ виплати, nextFundingTimestamp — наступної за нею (OKX)
+      nextTs: fr.fundingTimestamp || fr.nextFundingTimestamp,
+      mark: fr.markPrice || fr.indexPrice,
+    };
+  }
+
+  /** Свіжа ставка по одному символу (перед самим входом). */
+  async fetchFundingRate(symbol) {
+    if (this.client.has.fetchFundingRate) return this.normalizeRate(await this.client.fetchFundingRate(symbol), symbol);
+    const all = await this.client.fetchFundingRates([symbol]);
+    return this.normalizeRate(all[symbol], symbol);
+  }
+
+  /** Фактично отриманий (+) / сплачений (−) фандінг з біржі з моменту since. undefined — якщо біржа не віддала. */
+  async fetchFundingPaid(symbol, since) {
+    if (!this.client.has.fetchFundingHistory) return undefined;
+    const rows = await this.client.fetchFundingHistory(symbol, since);
+    if (!rows || !rows.length) return undefined;
+    return rows.filter((r) => (!r.symbol || r.symbol === symbol) && r.timestamp >= since).reduce((a, r) => a + (r.amount || 0), 0);
   }
 
   async fetchOrderBook(symbol, limit = 20) {
