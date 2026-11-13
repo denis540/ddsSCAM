@@ -55,12 +55,12 @@ const config = {
   // auto  — бот сам рахує по стаканах обох бірж, на яку суму можна зайти, але не більше MAX_TRADE_USDT
   // coins — вхід/вихід фіксованою кількістю монет (COIN_QTY / команда /qty), usdt — фіксованою сумою POSITION_USDT
   sizeMode: (process.env.SIZE_MODE || 'auto').toLowerCase(),
-  maxTradeUsdt: num('MAX_TRADE_USDT', 500), // ваш максимум на 1 угоду (на кожну ногу), USDT
+  maxTradeUsdt: num('MAX_TRADE_USDT', 100), // ваша сума (маржа) на 1 угоду на КОЖНІЙ біржі, USDT; позиція = сума × плече
   minTradeUsdt: num('MIN_TRADE_USDT', 20), // якщо стакан дозволяє менше — угоду пропускаємо
   checkExitDepth: bool('CHECK_EXIT_DEPTH', true), // враховувати і стакан на вихід
   coinQty,
   positionUsdt: num('POSITION_USDT', 100), // номінал КОЖНОЇ ноги (для SIZE_MODE=usdt)
-  leverage: num('LEVERAGE', 3),
+  leverage: num('LEVERAGE', 3), // бажане плече; фактичне — не більше максимуму обох бірж для монети, однакове на обох
   maxPositions: num('MAX_POSITIONS', 3),
   marginMode: process.env.MARGIN_MODE || 'isolated',
 

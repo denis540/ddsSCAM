@@ -52,7 +52,8 @@ test('auto: вхід обмежений стаканом біржі шорту',
   a.client.book = { bids: [[99.99, 3], [99, 100]], asks: [[100.01, 1e6]] };
   const cap = await trader.estimateCapacity(w);
   assert.match(cap.limitedBy, /стакан a \(вхід\)/);
-  assert.ok(Math.abs(cap.base - 3.337) < 0.01, String(cap.base));
+  assert.ok(Math.abs(cap.raw - 3.337) < 0.01, String(cap.raw));
+  assert.equal(cap.base, 3.3); // спільний крок: a — 0.001 ETH, b — 0.1 ETH
   assert.ok(await trader.tryOpen(w));
   const pos = trader.state.positions[0];
   assert.equal(pos.base, 3.3); // крок біржі b — 1 контракт по 0.1 ETH
@@ -61,11 +62,12 @@ test('auto: вхід обмежений стаканом біржі шорту',
   assert.ok(a && b);
 });
 
-test('auto: вхід обмежений вашим максимумом на угоду', async () => {
-  const { trader, w } = await setup({ maxTradeUsdt: 150 });
+test('auto: ваша сума × плече — позиція 50 USDT маржі × 3 = 150 USDT', async () => {
+  const { trader, w, msgs } = await setup({ maxTradeUsdt: 50, leverage: 3 });
   assert.ok(await trader.tryOpen(w));
   assert.equal(trader.state.positions[0].base, 1.5);
-  assert.equal(trader.state.positions[0].capacity.limitedBy, 'ваш максимум');
+  assert.equal(trader.state.positions[0].capacity.limitedBy, 'ваша сума 50×3');
+  assert.match(msgs[0], /плече x3 на обох → маржа ~50/);
 });
 
 test('auto: враховується стакан на вихід і кількість з /qty', async () => {
@@ -85,7 +87,7 @@ test('live: вхід обмежений вільною маржею', async () =
   const { a, trader, w } = await setup({ mode: 'live' });
   a.client.fetchBalance = async () => ({ free: { USDT: 100 } }); // 100 × 3 × 0.85 = 255 USDT
   const cap = await trader.estimateCapacity(w);
-  assert.equal(cap.limitedBy, 'маржа a');
+  assert.equal(cap.limitedBy, 'баланс a ×3');
   assert.ok(await trader.tryOpen(w));
   assert.equal(trader.state.positions[0].base, 2.5);
 });
@@ -121,4 +123,70 @@ test('auto: слипедж кожної ноги в нормі, але разо�
   const p = trader.state.positions[0];
   assert.ok(p.entryBasis >= -0.0015 - 1e-9, String(p.entryBasis));
   assert.ok(p.base > 5, String(p.base));
+});
+
+test('плече: однакове на обох біржах, не більше максимуму біржі', async () => {
+  const { a, b, trader, w, msgs } = await setup({ mode: 'live', leverage: 10, maxTradeUsdt: 20 });
+  b.client.markets['ETH/USDT:USDT'].limits.leverage = { max: 4 };
+  assert.ok(await trader.tryOpen(w));
+  assert.equal(a.client.leverage, 4);
+  assert.equal(b.client.leverage, 4);
+  assert.equal(trader.state.positions[0].leverage, 4);
+  assert.equal(trader.state.positions[0].base, 0.8); // 20 USDT × 4 / 100
+  assert.match(msgs[0], /плече x4 на обох/);
+});
+
+test('плече: біржа не прийняла — не заходимо', async () => {
+  const { a, b, trader, w } = await setup({ mode: 'live' });
+  b.client.leverageError = 'leverage exceeds limit';
+  assert.equal(await trader.tryOpen(w), false);
+  assert.equal(a.client.orders.length + b.client.orders.length, 0);
+});
+
+test('однакова кількість: спільний крок лотів (0.3 і 0.2 → 0.6)', async () => {
+  const { a, b, trader } = await setup({ sizeMode: 'coins', coinQty: { ETH: 1.3 } });
+  a.client.markets['ETH/USDT:USDT'].precision.amount = 0.3;
+  b.client.markets['ETH/USDT:USDT'].precision.amount = 2; // контракт 0.1 → крок 0.2 ETH
+  const S = 'ETH/USDT:USDT';
+  assert.equal(trader.pairStep(S, a, b), 0.6);
+  trader.cfg.sizeMode = 'auto';
+  const z = trader.sizePair(S, a, b, 100, 1.3);
+  assert.equal(z.base, 1.2);
+  assert.equal(a.contractsToBase(S, z.cS), 1.2);
+  assert.equal(b.contractsToBase(S, z.cL), 1.2);
+  trader.cfg.sizeMode = 'coins';
+  assert.match(trader.sizePair(S, a, b, 100, 1.3).error, /не кратна спільному кроку.*0\.6/);
+});
+
+test('часткове виконання на вході — ноги вирівнюються до однакової кількості', async () => {
+  const { a, b, trader, w, msgs } = await setup({ mode: 'live', maxTradeUsdt: 1000 });
+  b.client.fillRatio = 0.75; // лонг виконався на 75%
+  b.client.partialOnce = true;
+  assert.ok(await trader.tryOpen(w));
+  const p = trader.state.positions[0];
+  const sold = a.client.orders[0].amount;
+  const bought = Math.floor(b.client.orders[0].amount * 0.75) * 0.1; // біржа виконує цілі контракти
+  assert.equal(a.contractsToBase('ETH/USDT:USDT', p.short.contracts), p.base);
+  assert.equal(b.contractsToBase('ETH/USDT:USDT', p.long.contracts), p.base);
+  assert.ok(Math.abs(p.base - bought) < 1e-9, `${p.base} vs ${bought}`);
+  assert.equal(a.client.orders[1].side, 'buy');
+  assert.ok(a.client.orders[1].params.reduceOnly);
+  assert.ok(Math.abs(a.client.orders[1].amount - (sold - p.base)) < 1e-9);
+  assert.match(msgs.find((m) => m.includes('⚖️')), /вирівнюю до/);
+});
+
+test('часткове виконання на виході — бот дозакриває залишок, кількість та сама', async () => {
+  const { a, b, trader, w } = await setup({ mode: 'live', maxTradeUsdt: 50 });
+  assert.ok(await trader.tryOpen(w));
+  const base = trader.state.positions[0].base;
+  a.client.fillRatio = 0.5;
+  a.client.partialOnce = true;
+  a.client.partialDone = false;
+  const pos = trader.state.positions[0];
+  await trader.closePair(pos, 'тест');
+  assert.equal(trader.state.positions.length, 0);
+  const closes = a.client.orders.slice(1);
+  assert.equal(closes.length, 2, 'перший ордер виконано на 50%, другий — залишок');
+  assert.ok(Math.abs(closes.reduce((x, o) => x + o.amount * (o === closes[0] ? 0.5 : 1), 0) - base) < 1e-9);
+  assert.ok(b);
 });

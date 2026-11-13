@@ -72,7 +72,7 @@ function formatStatus(cfg, state, rates, lastScanAt) {
   return (
     `🤖 Режим: ${cfg.mode.toUpperCase()}${cfg.paused ? ' — ⏸ ПАУЗА (нові входи вимкнено)' : ''}\n` +
     `Біржі: ${cfg.exchanges.join(', ')}\n` +
-    `Розмір: ${cfg.sizeMode === 'auto' ? `авто за стаканом, до ${cfg.maxTradeUsdt} ${cfg.quote} на угоду (мін. ${cfg.minTradeUsdt})` : cfg.sizeMode === 'coins' ? `монети (${Object.keys(cfg.coinQty).length} налаштовано, /qty)` : `${cfg.positionUsdt} ${cfg.quote}`}, плече x${cfg.leverage}\n` +
+    `Розмір: ${cfg.sizeMode === 'auto' ? `авто за стаканами, маржа до ${cfg.maxTradeUsdt} ${cfg.quote} × плече на кожній біржі (мін. позиція ${cfg.minTradeUsdt})` : cfg.sizeMode === 'coins' ? `монети (${Object.keys(cfg.coinQty).length} налаштовано, /qty)` : `${cfg.positionUsdt} ${cfg.quote}`}, плече x${cfg.leverage}\n` +
     `Поріг: фандінг > ${pct(cfg.minFunding)}, чистий > ${pct(cfg.minProfit)}\n` +
     `Вхід за ${cfg.entryBeforeSec} с до виплати, вихід через ${cfg.exitAfterSec} с після / при сходженні (≤${pct(cfg.convergePct)})\n` +
     `Позиції: ${state.positions.length}/${cfg.maxPositions}, нереаліз. PnL ${sign(openU)} ${cfg.quote}\n\n` +

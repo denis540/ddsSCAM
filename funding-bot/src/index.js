@@ -150,7 +150,7 @@ async function main() {
     });
     const qtyInfo =
       cfg.sizeMode === 'auto'
-        ? `авто за стаканом, до ${cfg.maxTradeUsdt} ${cfg.quote} на угоду`
+        ? `авто за стаканами, маржа до ${cfg.maxTradeUsdt} ${cfg.quote} × плече на кожній біржі`
         : cfg.sizeMode === 'coins'
         ? Object.keys(cfg.coinQty).length
           ? `монети: ${Object.entries(cfg.coinQty).map(([c, q]) => `${c} ${q}`).join(', ')}`

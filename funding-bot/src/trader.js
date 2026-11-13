@@ -3,6 +3,7 @@
 const log = require('./logger');
 const { buildWindow, contrib } = require('./scanner');
 const { clock, duration } = require('./time');
+const { commonStep, floorToStep } = require('./exchange');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (x, d = 3) => `${(x * 100).toFixed(d)}%`;
@@ -93,28 +94,40 @@ class Trader {
     return this.cfg.positionUsdt / price;
   }
 
-  /** Підбирає однаковий обсяг у базовій монеті, який валідний на обох біржах. */
+  /** Спільний крок кількості монет для пари бірж: будь-яке кратне — валідна кількість на обох. */
+  pairStep(symbol, S, L) {
+    return commonStep(S.amountStep(symbol), L.amountStep(symbol));
+  }
+
+  /**
+   * Однакова кількість монет на обох біржах: округлюємо вниз до спільного кроку лотів
+   * і перевіряємо, що обидві біржі дають рівно цю кількість.
+   */
   sizePair(symbol, S, L, price, target) {
     if (!(target > 0)) return { error: 'не задано кількість монет (/qty)' };
-    let cS = S.baseToContracts(symbol, target);
-    let bS = S.contractsToBase(symbol, cS);
-    const bL0 = L.contractsToBase(symbol, L.baseToContracts(symbol, bS));
-    if (bL0 < bS) {
-      cS = S.baseToContracts(symbol, bL0);
-      bS = S.contractsToBase(symbol, cS);
-    }
-    const cL = L.baseToContracts(symbol, bS);
+    const step = this.pairStep(symbol, S, L);
+    const base = step ? floorToStep(target, step) : Math.min(S.contractsToBase(symbol, S.baseToContracts(symbol, target)), L.contractsToBase(symbol, L.baseToContracts(symbol, target)));
+    if (!(base > 0)) return { error: `кількість ${fmt(target, 8)} менша за спільний крок лота обох бірж (${fmt(step, 8)})` };
+    const cS = S.baseToContracts(symbol, base);
+    const cL = L.baseToContracts(symbol, base);
+    const bS = S.contractsToBase(symbol, cS);
     const bL = L.contractsToBase(symbol, cL);
-    const base = Math.min(bS, bL);
-    if (!(base > 0)) return { error: `кількість ${target} менша за мінімальний крок лота` };
-    if (Math.abs(bS - bL) / base > 0.01) return { error: 'кроки лотів на біржах несумісні' };
+    if (Math.abs(bS - base) > base * 1e-9 || Math.abs(bL - base) > base * 1e-9) {
+      return { error: `не вдалося підібрати однакову кількість на обох біржах (${fmt(bS, 8)} vs ${fmt(bL, 8)})` };
+    }
     const minB = Math.max(S.minBaseAmount(symbol, price), L.minBaseAmount(symbol, price));
     if (base < minB) return { error: `менше мінімального ордера (${fmt(minB, 8)})` };
-    // У режимі монет не допускаємо суттєвого округлення вниз — заходимо рівно тією кількістю, яку задали
-    if (this.cfg.sizeMode === 'coins' && (target - base) / target > 0.01) {
-      return { error: `кількість ${target} не кратна кроку лота (вийшло б ${fmt(base, 8)})` };
+    // У режимі монет заходимо рівно тією кількістю, яку задали
+    if (this.cfg.sizeMode === 'coins' && (target - base) / target > 1e-9) {
+      return { error: `кількість ${target} не кратна спільному кроку лотів обох бірж (${fmt(step, 8)}), найближче — ${fmt(base, 8)}` };
     }
-    return { base, cS, cL };
+    return { base, cS, cL, step };
+  }
+
+  /** Плече, однакове на обох біржах: ваше, але не більше максимуму кожної біржі для цієї монети. */
+  effectiveLeverage(symbol, S, L) {
+    const caps = [this.cfg.leverage, S.maxLeverage(symbol), L.maxLeverage(symbol)].filter((x) => x > 0);
+    return Math.max(1, Math.floor(Math.min(...caps)));
   }
 
   orderLine(side, exId, symbol, base, contracts, price, fee) {
@@ -160,6 +173,7 @@ class Trader {
     const uL = L.unitSize(symbol);
     const slip = cfg.maxSlippagePct;
 
+    const leverage = this.effectiveLeverage(symbol, S, L);
     const limits = {};
     limits[`стакан ${shortEx} (вхід)`] = maxDepth(obS.bids, uS, slip, 'sell');
     limits[`стакан ${longEx} (вхід)`] = maxDepth(obL.asks, uL, slip, 'buy');
@@ -169,13 +183,14 @@ class Trader {
     }
     if (!this.paper) {
       const [fS, fL] = await Promise.all([S.freeBalance(), L.freeBalance()]);
-      // залишаємо 15% маржі в запасі
-      limits[`маржа ${shortEx}`] = (fS * cfg.leverage * 0.85) / mid;
-      limits[`маржа ${longEx}`] = (fL * cfg.leverage * 0.85) / mid;
+      // вільний баланс × плече, 15% маржі лишаємо в запасі
+      limits[`баланс ${shortEx} ×${leverage}`] = (fS * leverage * 0.85) / mid;
+      limits[`баланс ${longEx} ×${leverage}`] = (fL * leverage * 0.85) / mid;
     }
     const coinCap = cfg.coinQty[coinOf(symbol)];
     if (cfg.sizeMode === 'auto') {
-      limits['ваш максимум'] = cfg.maxTradeUsdt / mid;
+      // ваша сума — це маржа на кожній біржі; позиція = сума × плече
+      limits[`ваша сума ${cfg.maxTradeUsdt}×${leverage}`] = (cfg.maxTradeUsdt * leverage) / mid;
       if (coinCap > 0) limits[`ваш максимум ${coinOf(symbol)}`] = coinCap;
     }
 
@@ -211,14 +226,16 @@ class Trader {
         limitedBy = 'ціна/прибутковість (чим більше обсяг, тим гірша ціна)';
       }
     }
-    return { base: Number.isFinite(base) ? base : 0, mid, limits, limitedBy, books: { obS, obL } };
+    // Однакова кількість на обох біржах — кратна спільному кроку лотів
+    const step = this.pairStep(symbol, S, L);
+    const exact = Number.isFinite(base) ? (step ? floorToStep(base, step) : base) : 0;
+    return { base: exact, raw: base, step, leverage, mid, limits, limitedBy, books: { obS, obL } };
   }
 
   capacityText(cap) {
     const q = this.cfg.quote;
     const parts = Object.entries(cap.limits).map(([k, v]) => `${k} ${fmt(v * cap.mid, 0)}`);
-    return `ліміти, ${q}: ${parts.join(' | ')}
-обмежує: ${cap.limitedBy}`;
+    return `ліміти позиції, ${q}: ${parts.join(' | ')}\nобмежує: ${cap.limitedBy}`;
   }
 
   /** Вхід у вікно фандінгу (викликається за ~entryBeforeSec до першої виплати). */
@@ -281,13 +298,17 @@ class Trader {
       const net = fresh.funding - fees + Math.min(basis, 0);
       if (net < this.cfg.minProfit) return skip(`чистий профіт ${pct(net)} < ${pct(this.cfg.minProfit)}`);
 
-      const leverage = this.cfg.leverage;
+      const { leverage } = cap; // однакове на обох біржах
       if (!this.paper) {
-        // маржу вже враховано в estimateCapacity
-        await Promise.all([
-          S.prepareSymbol(symbol, leverage, this.cfg.marginMode),
-          L.prepareSymbol(symbol, leverage, this.cfg.marginMode),
-        ]);
+        // маржу вже враховано в estimateCapacity; якщо біржа не прийняла плече — не заходимо
+        try {
+          await Promise.all([
+            S.prepareSymbol(symbol, leverage, this.cfg.marginMode),
+            L.prepareSymbol(symbol, leverage, this.cfg.marginMode),
+          ]);
+        } catch (e) {
+          return skip(e.message);
+        }
       }
       if (this.now() > win.startTs - this.cfg.entryMinSec * 1000) return skip('не встигли до виплати');
 
@@ -324,7 +345,9 @@ class Trader {
           `${pos.endTs !== pos.startTs ? `–${clock(pos.endTs, this.cfg.timezone)}` : ''}\n` +
           `${this.orderLine('sell', shortEx, symbol, pos.base, pos.short.contracts, pos.short.entry, legs.shortFee)}\n` +
           `${this.orderLine('buy', longEx, symbol, pos.base, pos.long.contracts, pos.long.entry, legs.longFee)}\n` +
-          `Розмір: ${fmt(notional, 2)} ${this.cfg.quote} (${this.cfg.sizeMode === 'auto' ? `макс. можливий зараз ~${fmt(cap.base * mid, 0)}` : `режим ${this.cfg.sizeMode}`})\n` +
+          `Кількість: ${fmt(pos.base, 8)} ${coinOf(symbol)} — однакова на обох біржах (крок ${fmt(cap.step, 8)})\n` +
+          `Розмір: ${fmt(notional, 2)} ${this.cfg.quote}, плече x${leverage} на обох → маржа ~${fmt(notional / leverage, 2)} на кожній біржі` +
+          `${this.cfg.sizeMode === 'auto' ? '' : ` (режим ${this.cfg.sizeMode})`}\n` +
           `${this.capacityText(cap)}\n` +
           `Виплати у вікні:\n${pos.events.map((e) => this.eventLine(e, pos.base, mid)).join('\n')}\n` +
           `Очікуваний фандінг: ${sgn(fresh.funding * 100, 4)}% ≈ ${sgn(fresh.funding * notional)} ${this.cfg.quote}\n` +
@@ -369,8 +392,11 @@ class Trader {
       long.average = long.average || pxL;
       const shortFee = short.fee ?? S.contractsToBase(symbol, short.filled) * short.average * S.takerFee(symbol);
       const longFee = long.fee ?? L.contractsToBase(symbol, long.filled) * long.average * L.takerFee(symbol);
-      await this.rebalanceIfNeeded(symbol, S, L, short, long);
-      const base = Math.min(S.contractsToBase(symbol, short.filled), L.contractsToBase(symbol, long.filled));
+      const base = await this.equalizeLegs(symbol, S, L, short, long);
+      if (!(base > 0)) {
+        await this.notify(`⚠️ ${symbol}: після вирівнювання ніг позиції не лишилось — вхід скасовано`);
+        return undefined;
+      }
       return { base, short, long, shortFee, longFee, fees: shortFee + longFee };
     }
     // Одна нога не відкрилась — відкатуємо іншу
@@ -390,36 +416,69 @@ class Trader {
     return undefined;
   }
 
-  /** Якщо біржі виконали різний обсяг (часткове виконання) — зрізаємо більшу ногу. */
-  async rebalanceIfNeeded(symbol, S, L, short, long) {
+  /**
+   * Біржі могли виконати ордери не повністю. Доводимо обидві ноги до ОДНАКОВОЇ кількості монет:
+   * найбільше кратне спільного кроку, що ≤ меншої ноги; зайве закриваємо reduceOnly.
+   * @returns {Promise<number>} кількість монет на кожній нозі
+   */
+  async equalizeLegs(symbol, S, L, short, long) {
     const bS = S.contractsToBase(symbol, short.filled);
     const bL = L.contractsToBase(symbol, long.filled);
-    const diff = bS - bL;
-    if (Math.abs(diff) / Math.max(bS, bL) < 0.005) return;
-    try {
-      const [ex, side, leg] = diff > 0 ? [S, 'buy', short] : [L, 'sell', long];
-      const c = ex.baseToContracts(symbol, Math.abs(diff));
-      if (c > 0) {
-        const o = await ex.marketOrder(symbol, side, c, { reduceOnly: true });
-        leg.filled -= c;
-        await this.notify(`⚖️ ${symbol}: ноги виконались різним обсягом, вирівнювання\n${this.orderLine(side, ex.id, symbol, ex.contractsToBase(symbol, c), c, o.average, o.fee)}`);
+    if (bS === bL) return bS;
+    const step = this.pairStep(symbol, S, L);
+    const target = step ? floorToStep(Math.min(bS, bL), step) : Math.min(bS, bL);
+    const lines = [];
+    for (const [ex, side, leg, b] of [[S, 'buy', short, bS], [L, 'sell', long, bL]]) {
+      const extra = Number((b - target).toPrecision(12));
+      if (extra <= 0) continue;
+      const c = ex.baseToContracts(symbol, extra);
+      if (!(c > 0)) continue;
+      try {
+        const o = await this.closeLegWithRetry(ex, symbol, side, c, {}, 3);
+        if (!o) continue;
+        leg.filled = Number((leg.filled - o.filled).toPrecision(12));
+        lines.push(this.orderLine(side, ex.id, symbol, ex.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
+      } catch (e) {
+        lines.push(`помилка на ${ex.id}: ${e.message}`);
       }
-    } catch (e) {
-      await this.notify(`⚠️ ${symbol}: не вдалося зрівняти ноги: ${e.message}`);
     }
+    const fS = S.contractsToBase(symbol, short.filled);
+    const fL = L.contractsToBase(symbol, long.filled);
+    await this.notify(
+      `⚖️ ${symbol}: біржі виконали різну кількість (${fmt(bS, 8)} / ${fmt(bL, 8)}), вирівнюю до ${fmt(target, 8)}\n${lines.join('\n')}` +
+        (fS !== fL ? `\n🚨 Ноги досі різні: ${S.id} ${fmt(fS, 8)}, ${L.id} ${fmt(fL, 8)} — перевірте вручну!` : '')
+    );
+    return Math.min(fS, fL);
   }
 
+  /**
+   * Закриття (reduceOnly) з повторами. Якщо біржа виконала частково — дозакриває залишок.
+   * @returns {Promise<{filled:number, average:number, fee:number|undefined}|undefined>}
+   */
   async closeLegWithRetry(exchange, symbol, side, contracts, opts = {}, attempts = 4) {
-    for (let i = 1; i <= attempts; i++) {
+    let left = contracts;
+    let filled = 0;
+    let cost = 0;
+    let fee;
+    for (let i = 1; i <= attempts && left > 0; i++) {
       try {
-        return await exchange.marketOrder(symbol, side, contracts, { ...opts, reduceOnly: true });
+        const o = await exchange.marketOrder(symbol, side, left, { ...opts, reduceOnly: true });
+        const f = Math.min(o.filled || 0, left);
+        filled = Number((filled + f).toPrecision(12));
+        cost += f * (o.average || 0);
+        if (o.fee !== undefined) fee = (fee || 0) + o.fee;
+        left = Number((left - f).toPrecision(12));
+        if (left > 0) log.warn(`${exchange.id} ${symbol}: закрито частково, лишилось ${left} контр. — дозакриваю`);
       } catch (e) {
         log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}/${attempts}: ${e.message}`);
         await sleep(500 * 2 ** i);
       }
     }
-    await this.notify(`🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ногу на ${exchange.id}! Потрібне ручне втручання.`);
-    return undefined;
+    if (left > 0) {
+      await this.notify(`🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ${filled > 0 ? `залишок ${left} контр. ` : ''}ноги на ${exchange.id}! Потрібне ручне втручання.`);
+      return undefined;
+    }
+    return { filled, average: filled > 0 ? cost / filled : undefined, fee };
   }
 
   /**

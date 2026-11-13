@@ -28,6 +28,36 @@ function parseIntervalHours(fr, cachedIntervals) {
   return 8;
 }
 
+/** Кількість знаків після коми (для точної арифметики кроків). */
+function decimals(x) {
+  const t = Number(x).toFixed(15).replace(/0+$/, '');
+  const i = t.indexOf('.');
+  return i < 0 ? 0 : t.length - i - 1;
+}
+
+/**
+ * Найменший спільний крок кількості монет для двох бірж (НСК кроків).
+ * Напр. 0.001 і 0.1 -> 0.1; 0.3 і 0.2 -> 0.6. Будь-яке кратне — валідна кількість на обох біржах.
+ */
+function commonStep(a, b) {
+  if (!(a > 0)) return b > 0 ? b : undefined;
+  if (!(b > 0)) return a;
+  const d = Math.max(decimals(a), decimals(b));
+  const scale = 10n ** BigInt(d);
+  const ia = BigInt(Math.round(a * 10 ** d));
+  const ib = BigInt(Math.round(b * 10 ** d));
+  const gcd = (x, y) => (y === 0n ? x : gcd(y, x % y));
+  const l = (ia / gcd(ia, ib)) * ib;
+  return Number(l) / Number(scale);
+}
+
+/** Округлення вниз до кроку без хвостів float. */
+function floorToStep(x, step) {
+  if (!(step > 0)) return x;
+  const n = Math.floor(x / step + 1e-9);
+  return Number((n * step).toPrecision(12));
+}
+
 /** Єдиний вигляд символу в боті: BTC/USDT:USDT (Kraken BTC/USD:USD теж стає BTC/USDT:USDT). */
 const canonical = (base) => `${base}/USDT:USDT`;
 
@@ -127,6 +157,21 @@ class Exchange {
       this.mult[c] = mult;
       this.marketBase[c] = base;
     }
+  }
+
+  /** Мінімальний крок кількості в МОНЕТАХ (крок лота в контрактах × монет у контракті). */
+  amountStep(symbol) {
+    const p = this.market(symbol).precision || {};
+    if (!(p.amount > 0)) return undefined;
+    const tick = this.client.precisionMode === ccxt.DECIMAL_PLACES ? 10 ** -p.amount : p.amount;
+    return Number((tick * this.unitSize(symbol)).toPrecision(12));
+  }
+
+  /** Максимальне плече для монети, якщо біржа його віддає в даних ринку. */
+  maxLeverage(symbol) {
+    const m = this.market(symbol);
+    const v = m.limits && m.limits.leverage && m.limits.leverage.max;
+    return v > 0 ? v : undefined;
   }
 
   /** Скільки справжніх монет в одному контракті (contractSize × множник). */
@@ -239,24 +284,29 @@ class Exchange {
     return Math.max(minContracts * cs, price ? minCost / price : 0);
   }
 
+  /**
+   * Режим маржі і плече перед входом. Якщо біржа не прийняла плече — кидає помилку,
+   * щоб не відкрити позицію з невідомим плечем.
+   */
   async prepareSymbol(symbol, leverage, marginMode) {
     const s = this.n(symbol);
     const key = `${s}|${leverage}|${marginMode}`; // при зміні плеча/режиму налаштовуємо заново
     if (this.leverageSet.has(key)) return;
     this.lastLeverage = leverage;
     this.lastMarginMode = marginMode;
+    const benign = (e) => e instanceof ccxt.NoChange || e instanceof ccxt.MarginModeAlreadySet || /not modified|no change|same|already|unchanged|no need/i.test(e.message);
     if (this.client.has.setMarginMode && marginMode) {
       try {
         await this.client.setMarginMode(marginMode, s, { leverage });
       } catch (e) {
-        log.debug(`${this.id} setMarginMode ${s}: ${e.message}`);
+        if (!benign(e)) log.warn(`${this.id} setMarginMode ${s}: ${e.message}`);
       }
     }
     if (this.client.has.setLeverage) {
       try {
         await this.client.setLeverage(leverage, s);
       } catch (e) {
-        log.debug(`${this.id} setLeverage ${s}: ${e.message}`);
+        if (!benign(e)) throw new Error(`${this.title}: не вдалося встановити плече x${leverage} для ${symbol.split('/')[0]}: ${e.message}`);
       }
     }
     this.leverageSet.add(key);
@@ -322,4 +372,4 @@ class Exchange {
   }
 }
 
-module.exports = { Exchange, parseIntervalHours, canonical, parseMultiplier };
+module.exports = { Exchange, parseIntervalHours, canonical, parseMultiplier, commonStep, floorToStep };
