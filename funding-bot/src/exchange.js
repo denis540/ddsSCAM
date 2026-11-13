@@ -90,7 +90,8 @@ class Exchange {
     } else {
       const Cls = ccxt[this.meta.ccxt];
       if (!Cls) throw new Error(`ccxt не підтримує біржу ${this.id}`);
-      this.client = new Cls({ enableRateLimit: true, options: { ...(this.meta.options || {}) } });
+      // adjustForTimeDifference — підписи запитів з поправкою на годинник біржі
+      this.client = new Cls({ enableRateLimit: true, options: { adjustForTimeDifference: true, ...(this.meta.options || {}) } });
     }
     this.setCredentials(credentials);
     this.intervals = {};
@@ -99,6 +100,16 @@ class Exchange {
     this.fromNative = {}; // символ біржі -> канонічний
     this.mult = {}; // канонічний -> множник (1000 для 1000PEPE)
     this.ready = false;
+    this.iocUnsupported = false; // біржа відхилила лімітний IOC — далі лише ринкові
+    this.tradeBlocked = undefined; // причина, чому на біржі не можна торгувати (напр. hedge mode)
+    this.tickers = {}; // канонічний символ -> { volumeUsdt }
+  }
+
+  /** Тестова мережа біржі (SANDBOX=true). @returns {boolean} чи підтримується */
+  enableSandbox() {
+    if (this.meta.sandbox === false || !(this.client.urls && this.client.urls.test)) return false;
+    this.client.setSandboxMode(true);
+    return true;
   }
 
   setCredentials(c = {}) {
@@ -362,6 +373,165 @@ class Exchange {
       average: (o.average || o.price) ? (o.average || o.price) / (this.mult[symbol] || 1) : undefined,
       fee: o.fee && [settle, this.quote].includes(o.fee.currency) ? o.fee.cost : undefined,
     };
+  }
+
+  /** Ціна за 1 монету -> ціна в одиницях ринку біржі (з урахуванням множника), округлена до тіку. */
+  nativePrice(symbol, pricePerCoin) {
+    const p = pricePerCoin * (this.mult[symbol] || 1);
+    return Number(this.client.priceToPrecision(this.n(symbol), p));
+  }
+
+  /**
+   * Лімітний ордер IOC: виконується одразу в межах ціни (не гірше priceCap за монету), решта скасовується.
+   * Захищає від проковзування, якщо стакан змінився між перевіркою і ордером.
+   */
+  async limitIOC(symbol, side, contracts, priceCap, { reduceOnly = false, leverage, marginMode } = {}) {
+    const s = this.n(symbol);
+    const params = { timeInForce: 'IOC' };
+    if (reduceOnly) params.reduceOnly = true;
+    const lev = leverage || this.lastLeverage;
+    if (this.meta.openParams && lev) Object.assign(params, this.meta.openParams(lev, marginMode || this.lastMarginMode));
+    const price = this.nativePrice(symbol, priceCap);
+    const order = await this.client.createOrder(s, 'limit', side, contracts, price, params);
+    let o = order;
+    if ((!Number.isFinite(o.filled) || (o.filled > 0 && !o.average)) && this.client.has.fetchOrder && o.id) {
+      try {
+        o = await this.client.fetchOrder(o.id, s);
+      } catch (e) {
+        log.debug(`${this.id} fetchOrder: ${e.message}`);
+      }
+    }
+    const settle = this.settleOf(symbol);
+    const filled = Number.isFinite(o.filled) ? o.filled : 0;
+    return {
+      id: o.id,
+      filled,
+      average: filled > 0 && (o.average || o.price) ? (o.average || o.price) / (this.mult[symbol] || 1) : undefined,
+      fee: o.fee && [settle, this.quote].includes(o.fee.currency) ? o.fee.cost : undefined,
+      type: 'limit',
+    };
+  }
+
+  /**
+   * Захисний стоп на біржі: reduceOnly-ордер, який біржа виконає сама, навіть якщо бот не працює.
+   * side — сторона закриття (buy для шорту, sell для лонгу), stopPrice — за 1 монету.
+   */
+  async placeStop(symbol, side, contracts, stopPrice) {
+    const s = this.n(symbol);
+    const trig = this.nativePrice(symbol, stopPrice);
+    const attempts = [
+      { stopLossPrice: trig, reduceOnly: true },
+      { triggerPrice: trig, reduceOnly: true, triggerDirection: side === 'buy' ? 'above' : 'below' },
+    ];
+    let lastErr;
+    for (const params of attempts) {
+      try {
+        const o = await this.client.createOrder(s, 'market', side, contracts, undefined, params);
+        return { id: o.id, price: stopPrice };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  }
+
+  async cancelStop(symbol, id) {
+    if (!id) return;
+    const s = this.n(symbol);
+    for (const params of [{ trigger: true }, {}, { stop: true }]) {
+      try {
+        await this.client.cancelOrder(id, s, params);
+        return;
+      } catch (e) {
+        if (e instanceof ccxt.OrderNotFound) return;
+      }
+    }
+  }
+
+  /**
+   * Перевіряє режим позицій: потрібен one-way. Якщо hedge — пробує перемкнути.
+   * @returns {Promise<string|undefined>} опис проблеми, якщо торгувати не можна
+   */
+  async ensureOneWay() {
+    const h = this.client.has;
+    if (!this.hasKeys || (!h.fetchPositionMode && !h.setPositionMode)) return undefined;
+    try {
+      if (h.fetchPositionMode) {
+        const m = await this.client.fetchPositionMode();
+        if (m && m.hedged === false) return undefined;
+      }
+      if (h.setPositionMode) {
+        try {
+          await this.client.setPositionMode(false);
+        } catch (e) {
+          if (!/not modified|no need|same|already|unchanged/i.test(e.message)) throw e;
+        }
+        return undefined;
+      }
+      return 'акаунт у hedge mode — перемкніть на one-way вручну';
+    } catch (e) {
+      return `не вдалося перевірити/перемкнути режим позицій на one-way: ${e.message.slice(0, 150)}`;
+    }
+  }
+
+  /** Час сервера біржі мінус локальний час, мс (з урахуванням затримки мережі). */
+  async clockOffset() {
+    if (!this.client.has.fetchTime) return undefined;
+    const t0 = Date.now();
+    const server = await this.client.fetchTime();
+    const t1 = Date.now();
+    return server - (t0 + t1) / 2;
+  }
+
+  /** Обсяги торгів за 24 год (USDT) по всіх монетах. */
+  async loadTickers() {
+    if (!this.client.has.fetchTickers) return;
+    const raw = await this.client.fetchTickers();
+    const out = {};
+    for (const [sym, t] of Object.entries(raw || {})) {
+      const c = this.fromNative[t.symbol || sym];
+      if (!c) continue;
+      let v = t.quoteVolume;
+      if (!(v > 0) && t.baseVolume > 0 && t.last > 0) v = t.baseVolume * t.last * (this.market(c).contractSize || 1);
+      out[c] = { volumeUsdt: v > 0 ? v : undefined };
+    }
+    this.tickers = out;
+    this.tickersAt = Date.now();
+  }
+
+  /**
+   * Ризики ринку: щойно лістингована монета, запланований делістинг/експірація, ринок не торгується.
+   * @returns {string|undefined} причина не торгувати
+   */
+  marketRisk(symbol, { newListingDays = 3, delistDays = 14 } = {}, now = Date.now()) {
+    const m = this.client.markets[this.n(symbol)];
+    if (!m) return 'ринку немає';
+    const info = m.info || {};
+    const status = String(info.status || info.state || info.contractStatus || '').toLowerCase();
+    if (/settl|deliver|delist|close|pause|halt|suspend|pre|pending/.test(status) && !/^(trading|live|normal|open|online|listed)$/.test(status)) {
+      return `статус ринку «${status}»`;
+    }
+    const created = m.created || Number(info.onboardDate) || Number(info.launchTime) || Number(info.listTime) || undefined;
+    if (created > 0 && now - created < newListingDays * 86400000) return `нова монета (лістинг ${Math.round((now - created) / 3600000)} год тому)`;
+    const dates = [m.expiry, info.deliveryDate, info.deliveryTime, info.expTime, info.offTime, info.delistTime, info.delisting_time, info.expireDate]
+      .map(Number)
+      .filter((x) => x > now && x < now + 5 * 365 * 86400000);
+    const soon = dates.find((d) => d - now < delistDays * 86400000);
+    if (soon) return `делістинг/експірація через ${Math.round((soon - now) / 86400000)} дн`;
+    return undefined;
+  }
+
+  /**
+   * Фактична середня ціна, за якою біржа закрила ногу (стоп / ліквідація / вручну), з історії угод.
+   * @returns {Promise<number|undefined>} ціна за 1 монету
+   */
+  async lastClosePrice(symbol, side, since) {
+    if (!this.client.has.fetchMyTrades) return undefined;
+    const trades = await this.client.fetchMyTrades(this.n(symbol), since);
+    const t = (trades || []).filter((x) => x.side === side && x.timestamp >= since);
+    const qty = t.reduce((a, x) => a + (x.amount || 0), 0);
+    if (!(qty > 0)) return undefined;
+    return t.reduce((a, x) => a + x.price * (x.amount || 0), 0) / qty / (this.mult[symbol] || 1);
   }
 
   async fetchPosition(symbol) {

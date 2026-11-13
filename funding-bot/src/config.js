@@ -81,8 +81,27 @@ const config = {
   settleDelaySec: num('SETTLE_DELAY_SEC', 10), // раніше цього після виплати не закриваємось (щоб біржа точно нарахувала)
   convergePct: num('CONVERGE_PCT', 0.05) / 100, // ціни «зійшлися», якщо різниця між біржами ≤ X%
   earlyExit: bool('EARLY_EXIT', true), // вийти ще ДО виплати, якщо прибуток від цін уже більший за очікуваний фандінг
-  liqBufferPct: num('LIQ_BUFFER_PCT', 15) / 100, // закриваємо пару, якщо до ліквідації менше X%
+  maxConvergeWaitMin: num('MAX_CONVERGE_WAIT_MIN', 30), // після виплати чекати сходження цін до N хв замість виходу в мінус
+
+  // --- Захист від втрат ---
+  orderType: (process.env.ORDER_TYPE || 'auto').toLowerCase(), // auto — бот сам: лімітний IOC з межею ціни або ринковий; market — завжди ринковий
+  liqClosePct: num('LIQ_CLOSE_PCT', 60) / 100, // бот закриває пару, коли ціна пройшла X% шляху від входу до ліквідації будь-якої ноги
   liqCheckSec: num('LIQ_CHECK_SEC', 5), // як часто перевіряти ризик ліквідації, сек
+  protectStops: bool('PROTECT_STOPS', true), // стоп-ордери на самих біржах (спрацюють, навіть якщо бот упав)
+  stopAtPct: num('STOP_AT_PCT', 80) / 100, // стоп на біржі на Y% шляху до ліквідації (має бути > LIQ_CLOSE_PCT)
+  reconcileMin: num('RECONCILE_MIN', 2), // звірка позицій бота з біржами кожні N хв
+  maxDailyLossUsdt: num('MAX_DAILY_LOSS_USDT', 20), // збиток за день більший — пауза входів (0 = вимк.)
+  maxLossStreak: num('MAX_LOSS_STREAK', 3), // стільки збиткових угод поспіль — пауза (0 = вимк.)
+  maxErrors: num('MAX_ERRORS', 5), // стільки помилок ордерів за 10 хв — пауза (0 = вимк.)
+  maxTotalUsdt: num('MAX_TOTAL_USDT', 0), // макс. сумарна позиція всіх угод (на одну ногу), USDT (0 = без ліміту)
+  maxExchangeUsdt: num('MAX_EXCHANGE_USDT', 0), // макс. сумарна позиція на одній біржі, USDT (0 = без ліміту)
+  reservePct: num('RESERVE_PCT', 20) / 100, // частка вільного балансу, яку бот ніколи не використовує
+  minVolumeUsdt: num('MIN_VOLUME_USDT', 1000000), // мін. обсяг торгів монети за 24 год на КОЖНІЙ біржі пари
+  newListingDays: num('NEW_LISTING_DAYS', 3), // не торгувати монети, лістинговані менше N днів тому
+  delistDays: num('DELIST_DAYS', 14), // не торгувати монети з делістингом/експірацією в найближчі N днів
+  maxClockSkewMs: num('MAX_CLOCK_SKEW_MS', 1500), // попередження, якщо годинник сервера розходиться з біржами
+  heartbeatHours: num('HEARTBEAT_HOURS', 3), // повідомлення «я працюю» в Telegram (0 = вимк.)
+  sandbox: bool('SANDBOX', false), // тестові мережі бірж (Binance, Bybit, OKX, BingX, Kraken)
 
   // Перевірка, що монети з однаковою назвою — одна й та сама монета
   coinPriceTol: num('COIN_PRICE_TOL_PCT', 3) / 100, // різниця цін більша — вважаємо різними монетами

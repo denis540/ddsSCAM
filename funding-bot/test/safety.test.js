@@ -1,0 +1,348 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert');
+const { Trader } = require('../src/trader');
+const { State } = require('../src/state');
+const { Guard } = require('../src/guard');
+const { Reconciler } = require('../src/reconcile');
+const { Exchange } = require('../src/exchange');
+const { planWindows, dueWindows } = require('../src/scanner');
+const { setClockOffset, nowSynced } = require('../src/time');
+const { makeExchange, fakeClient } = require('./helpers');
+
+const SYM = 'ETH/USDT:USDT';
+const baseCfg = {
+  mode: 'live', quote: 'USDT', sizeMode: 'auto', maxTradeUsdt: 50, minTradeUsdt: 5, checkExitDepth: true, paused: false,
+  positionUsdt: 100, leverage: 3, maxPositions: 3, marginMode: 'isolated', timezone: 'Europe/Kyiv',
+  minFunding: 0.001, minProfit: 0, entryBeforeSec: 120, entryMinSec: 20, maxWindowHours: 8, allowEstimated: true,
+  maxEntryBasisPct: 0.0015, maxSlippagePct: 0.001, maxAbsFundingRate: 0.1, exitAfterSec: 120, settleDelaySec: 10,
+  convergePct: 0.0005, earlyExit: false, whitelist: [], blacklist: [], defaultTakerFee: 0.0005, coinPriceTol: 0.03,
+  orderType: 'auto', liqClosePct: 0.6, liqCheckSec: 5, protectStops: true, stopAtPct: 0.8, maxConvergeWaitMin: 30,
+  maxDailyLossUsdt: 20, maxLossStreak: 3, maxErrors: 5, reservePct: 0.2, maxTotalUsdt: 0, maxExchangeUsdt: 0,
+};
+
+async function setup(over = {}) {
+  const cfg = { ...baseCfg, coinQty: {}, ...over };
+  const T0 = Date.now();
+  const a = await makeExchange('a', { rate: 0.03 });
+  const b = await makeExchange('b', { rate: 0.01, contractSize: 0.1, step: 1 });
+  a.client.next = T0 + 100000;
+  b.client.next = T0 + 100000;
+  const state = new State(null);
+  const msgs = [];
+  const notify = async (t) => { msgs.push(t); };
+  const trader = new Trader(cfg, { a, b }, state, notify);
+  const guard = new Guard(cfg, state, null, notify);
+  trader.guard = guard;
+  let now = T0;
+  trader.now = () => now;
+  const at = (ms) => { now = T0 + ms; };
+  const rates = async () => ({ a: await a.fetchFundingRates(), b: await b.fetchFundingRates() });
+  const window = async () => dueWindows(planWindows(await rates(), cfg, undefined, T0), cfg, T0)[0];
+  return { cfg, a, b, state, trader, guard, msgs, at, rates, window, T0 };
+}
+
+// ---------- 1. Захисні стопи на біржах ----------
+
+test('стопи на біржах ставляться після входу (80% шляху до ліквідації) і знімаються після виходу', async () => {
+  const { a, b, state, trader, rates, window, at, msgs } = await setup();
+  a.client.liq = 133.33;
+  b.client.liq = 66.67;
+  assert.ok(await trader.tryOpen(await window()));
+  const pos = state.positions[0];
+  assert.equal(a.client.stops.length, 1);
+  assert.equal(b.client.stops.length, 1);
+  const sa = a.client.stops[0];
+  const sb = b.client.stops[0];
+  assert.equal(sa.side, 'buy');
+  assert.equal(sb.side, 'sell');
+  assert.ok(sa.params.reduceOnly && sb.params.reduceOnly);
+  // шорт: вхід 99.99 → ліквідація 133.33 → стоп на 80% шляху ≈ 126.66
+  assert.ok(Math.abs(sa.params.stopLossPrice - (pos.short.entry + (133.33 - pos.short.entry) * 0.8)) < 1e-6, String(sa.params.stopLossPrice));
+  assert.ok(sb.params.stopLossPrice < pos.long.entry && sb.params.stopLossPrice > 66.67);
+  assert.match(msgs.join('\n'), /захисні стопи на біржах/);
+  at(115000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.equal(a.client.stops[0].active, false, 'стоп скасовано після виходу');
+  assert.equal(b.client.stops[0].active, false);
+});
+
+test('біржа не прийняла стоп — попередження, позиція лишається під захистом бота', async () => {
+  const { a, state, trader, window, msgs, guard } = await setup();
+  a.client.stopFail = true;
+  assert.ok(await trader.tryOpen(await window()));
+  assert.equal(state.positions.length, 1);
+  assert.match(msgs.join('\n'), /стоп не поставлено/);
+  assert.equal(guard.errors.length, 1);
+});
+
+test('спрацював стоп / ліквідація на одній біржі — бот одразу закриває другу ногу ринком', async () => {
+  const { a, b, state, trader, rates, window, at, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.pos[SYM] = 0; // біржа a закрила шорт (стоп)
+  at(10000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  const last = b.client.orders.at(-1);
+  assert.equal(last.side, 'sell');
+  assert.equal(last.type, 'market');
+  assert.ok(last.params.reduceOnly);
+  const exit = msgs.find((m) => m.includes('ВИХІД'));
+  assert.match(exit, /зникла/);
+  assert.match(exit, /SHORT закрила біржа, ціна 100\.01 \(оцінка за стаканом\)/);
+  assert.ok(Math.abs(state.data.closed[0].pricePnl) < 0.1, 'без фантомного збитку');
+  // з історією угод біржі — фактична ціна
+  const s2 = await setup();
+  assert.ok(await s2.trader.tryOpen(await s2.window()));
+  s2.a.client.pos[SYM] = 0;
+  s2.a.client.has.fetchMyTrades = true;
+  s2.a.client.fetchMyTrades = async () => [{ side: 'buy', price: 104, amount: 0.5, timestamp: Date.now() + 5000 }];
+  s2.at(10000);
+  await s2.trader.manage(await s2.rates());
+  assert.match(s2.msgs.find((m) => m.includes('ВИХІД')), /ціна 104 \(факт з біржі\)/);
+});
+
+// ---------- 2. Звірка з біржами ----------
+
+test('звірка: непарна нога після збою посеред відкриття закривається автоматично', async () => {
+  const { a, state, trader, msgs } = await setup();
+  state.setPending({ symbol: SYM, shortEx: 'a', longEx: 'b', ts: Date.now() - 60000 });
+  a.client.pos[SYM] = -0.5; // шорт відкрився, бот впав до лонгу
+  const rec = new Reconciler(trader.cfg, state, trader.ex, trader, async (t) => { msgs.push(t); });
+  const r = await rec.run();
+  assert.equal(r.autoClosed.length, 1);
+  assert.equal(a.client.pos[SYM], 0);
+  assert.equal(a.client.orders.at(-1).type, 'market');
+  assert.match(msgs.at(-1), /непарну ногу .* закрито/);
+});
+
+test('звірка: невідома позиція — попередження з кнопкою, закриття кнопкою; збіг — тиша', async () => {
+  const { a, b, state, trader, window } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  const sent = [];
+  const rec = new Reconciler(trader.cfg, state, trader.ex, trader, async (t, m) => { sent.push({ t, m }); });
+  let r = await rec.run();
+  assert.equal(r.orphans.length + r.mismatches.length, 0, 'позиції бота збігаються з біржами');
+  b.client.pos['BTC/USDT:USDT'] = 3; // чужа позиція
+  b.client.markets['BTC/USDT:USDT'] = { ...b.client.markets[SYM], symbol: 'BTC/USDT:USDT', base: 'BTC' };
+  b.buildSymbolMap();
+  r = await rec.run();
+  assert.equal(r.orphans.length, 1);
+  const btn = sent.at(-1).m.inline_keyboard[0][0];
+  assert.match(btn.callback_data, /^orph:/);
+  await rec.run();
+  assert.equal(sent.filter((x) => x.m).length, 1, 'про ту саму позицію не повторюємо');
+  const res = await rec.closeOrphan(btn.callback_data.split(':')[1]);
+  assert.match(res, /Закрито/);
+  assert.equal(b.client.pos['BTC/USDT:USDT'], 0);
+  // розбіжність кількості
+  a.client.pos[SYM] -= 0.1;
+  r = await rec.run();
+  assert.equal(r.mismatches.length, 1);
+});
+
+// ---------- 3. Тип ордерів: бот обирає сам ----------
+
+test('вхід лімітними IOC з межею ціни; стакан змінився і лімітка не виконалась — без збитку', async () => {
+  const { a, b, state, trader, window, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  const oa = a.client.orders[0];
+  const ob = b.client.orders[0];
+  assert.equal(oa.type, 'limit');
+  assert.equal(oa.params.timeInForce, 'IOC');
+  assert.equal(ob.type, 'limit');
+  assert.match(msgs[0], /\[ліміт IOC\]/);
+  assert.equal(state.positions.length, 1);
+
+  const s2 = await setup();
+  s2.b.client.limitFill = 0; // лімітка лонгу не виконалась (стакан пішов)
+  assert.equal(await s2.trader.tryOpen(await s2.window()), false);
+  assert.equal(s2.a.client.pos[SYM], 0, 'шорт закрито, ноги не лишилось');
+  assert.equal(s2.a.client.orders.at(-1).type, 'market', 'термінове закриття — ринком');
+  assert.match(s2.msgs.join('\n'), /вхід скасовано/);
+});
+
+test('біржа не приймає IOC — бот перемикається на ринкові для неї', async () => {
+  const { a, state, trader, window, msgs } = await setup();
+  a.client.iocError = 'timeInForce IOC not supported';
+  assert.ok(await trader.tryOpen(await window()));
+  assert.ok(a.iocUnsupported);
+  assert.equal(a.client.orders[0].type, 'market');
+  assert.match(msgs[0], /на a .*\[ринок\]/);
+  assert.equal(state.positions.length, 1);
+});
+
+test('ORDER_TYPE=market — лише ринкові', async () => {
+  const { a, b, trader, window } = await setup({ orderType: 'market' });
+  assert.ok(await trader.tryOpen(await window()));
+  assert.equal(a.client.orders[0].type, 'market');
+  assert.equal(b.client.orders[0].type, 'market');
+});
+
+test('вихід: лімітка не виконалась двічі — бот закриває ринком (вихід гарантовано)', async () => {
+  const s = await setup();
+  assert.ok(await s.trader.tryOpen(await s.window()));
+  s.a.client.limitFill = 0; // лімітки на a не виконуються
+  const pos = s.state.positions[0];
+  await s.trader.closePair(pos, 'тест');
+  const closes = s.a.client.orders.slice(1);
+  assert.deepEqual(closes.map((o) => o.type), ['limit', 'limit', 'market']);
+  assert.equal(s.a.client.pos[SYM], 0);
+  assert.equal(s.state.positions.length, 0);
+});
+
+// ---------- 4. Режим позицій ----------
+
+test('hedge mode: бот перемикає на one-way; якщо не вдається — торгівлю на біржі блокує', async () => {
+  const c = fakeClient();
+  c.has.fetchPositionMode = true;
+  c.has.setPositionMode = true;
+  let hedged = true;
+  c.fetchPositionMode = async () => ({ hedged });
+  c.setPositionMode = async (h) => { hedged = h; };
+  const ex = new Exchange('x', { apiKey: 'k', secret: 's' }, { client: c });
+  assert.equal(await ex.ensureOneWay(), undefined);
+  assert.equal(hedged, false);
+  hedged = true;
+  c.setPositionMode = async () => { throw new Error('position exists'); };
+  assert.match(await ex.ensureOneWay(), /не вдалося .* one-way/);
+  const { a, trader, window } = await setup();
+  a.tradeBlocked = 'hedge mode';
+  assert.equal(await trader.tryOpen(await window()), false);
+});
+
+// ---------- 5. Аварійні запобіжники ----------
+
+test('запобіжники: збиток за день, збиткові поспіль, помилки — автопауза; /resume знімає', async () => {
+  const { cfg, state, guard, msgs } = await setup();
+  state.addDaily('pnl', -25);
+  await guard.onTradeClosed(-25);
+  assert.ok(cfg.paused);
+  assert.match(cfg.pauseReason, /збиток за сьогодні -25/);
+  assert.match(msgs.at(-1), /АВТОПАУЗА/);
+  guard.resume();
+  cfg.paused = false;
+
+  const s2 = await setup();
+  for (let i = 0; i < 3; i++) await s2.guard.onTradeClosed(-0.1);
+  assert.match(s2.cfg.pauseReason, /3 збиткових угод поспіль/);
+
+  const s3 = await setup();
+  await s3.guard.onTradeClosed(-0.1);
+  await s3.guard.onTradeClosed(+1);
+  await s3.guard.onTradeClosed(-0.1);
+  assert.ok(!s3.cfg.paused, 'прибуткова угода обнуляє серію');
+  for (let i = 0; i < 5; i++) await s3.guard.onError('x');
+  assert.match(s3.cfg.pauseReason, /5 помилок ордерів/);
+});
+
+test('на автопаузі нові позиції не відкриваються', async () => {
+  const { cfg, trader, window, guard } = await setup();
+  await guard.trip('тест');
+  assert.equal(await trader.tryOpen(await window()), false);
+  assert.ok(cfg.paused);
+});
+
+// ---------- 6. Очікування сходження цін ----------
+
+test('після виплати ціни не зійшлися і вихід у мінус — чекаємо; зійшлись — виходимо', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup();
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.price = 103; // шорт у мінусі на 3% > фандінгу 2%
+  at(100000 + 125000); // минуло exitAfter
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'не продаємо в мінус');
+  assert.match(msgs.at(-1), /чекаю сходження до/);
+  at(100000 + 300000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1);
+  assert.equal(msgs.filter((m) => m.includes('чекаю сходження')).length, 1, 'повідомлення один раз');
+  a.client.price = 100;
+  at(100000 + 400000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /ціни зійшлися/);
+});
+
+test('чекання не довше maxwait і не до наступної виплати', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup({ maxConvergeWaitMin: 30 });
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.price = 103;
+  a.client.next = Date.now() + 100000 + 10 * 60000; // наступна виплата на a через 10 хв після нашої
+  at(100000 + 125000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1);
+  at(100000 + 9 * 60000 + 1000); // за хвилину до наступної виплати — виходимо
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /ціни так і не зійшлися/);
+});
+
+// ---------- 7. Небезпечні монети ----------
+
+test('ризики ринку: нова монета, делістинг, статус', () => {
+  const now = Date.now();
+  const c = fakeClient();
+  const ex = new Exchange('x', {}, { client: c });
+  ex.native[SYM] = SYM;
+  const m = c.markets[SYM];
+  assert.equal(ex.marketRisk(SYM, {}, now), undefined);
+  m.created = now - 3600000;
+  assert.match(ex.marketRisk(SYM, { newListingDays: 3 }, now), /нова монета/);
+  m.created = now - 30 * 86400000;
+  m.info = { deliveryDate: String(now + 5 * 86400000) };
+  assert.match(ex.marketRisk(SYM, { delistDays: 14 }, now), /делістинг.*через 5 дн/);
+  m.info = { deliveryDate: '4133404800000' }; // Binance: «безстроковий» перпетуал
+  assert.equal(ex.marketRisk(SYM, {}, now), undefined);
+  m.info = { status: 'SETTLING' };
+  assert.match(ex.marketRisk(SYM, {}, now), /статус/);
+  m.info = { status: 'TRADING' };
+  assert.equal(ex.marketRisk(SYM, {}, now), undefined);
+});
+
+// ---------- 8. Годинник ----------
+
+test('поправка годинника: бот рахує таймінги за часом біржі', async () => {
+  const c = fakeClient();
+  c.has.fetchTime = true;
+  c.fetchTime = async () => Date.now() + 2500;
+  const ex = new Exchange('x', {}, { client: c });
+  const off = await ex.clockOffset();
+  assert.ok(Math.abs(off - 2500) < 50, String(off));
+  setClockOffset(off);
+  assert.ok(Math.abs(nowSynced() - Date.now() - 2500) < 50);
+  setClockOffset(0);
+});
+
+// ---------- 9. Ліміти експозиції і резерв ----------
+
+test('загальний ліміт позицій і ліміт на біржу обмежують розмір', async () => {
+  const { trader, window, state, cfg } = await setup({ maxTradeUsdt: 1000, maxTotalUsdt: 120 });
+  const cap = await trader.estimateCapacity(await window());
+  assert.equal(cap.limitedBy, 'загальний ліміт позицій');
+  assert.ok(Math.abs(cap.base * cap.mid - 120) < 1);
+  cfg.maxTotalUsdt = 0;
+  cfg.maxExchangeUsdt = 80;
+  state.positions.push({ symbol: 'X/USDT:USDT', shortEx: 'a', longEx: 'c', base: 0.5, short: { entry: 100 }, long: { entry: 100 } });
+  const cap2 = await trader.estimateCapacity(await window());
+  assert.equal(cap2.limitedBy, 'ліміт біржі a');
+  assert.ok(Math.abs(cap2.base * cap2.mid - 30) < 1, 'на біржі a вже 50 з 80');
+});
+
+test('резерв балансу: бот не використовує 20% вільного балансу', async () => {
+  const { a, trader, window } = await setup({ maxTradeUsdt: 10000, reservePct: 0.2 });
+  a.client.fetchBalance = async () => ({ free: { USDT: 100 } });
+  const cap = await trader.estimateCapacity(await window());
+  assert.equal(cap.limitedBy, 'баланс a ×3');
+  assert.ok(Math.abs(cap.raw * cap.mid - 240) < 1, String(cap.raw * cap.mid)); // 100 × 3 × 0.8
+});
+
+// ---------- 11. Тестові мережі ----------
+
+test('SANDBOX: тестова мережа є у Binance/Bybit/OKX/BingX/Kraken, немає у HTX/Bitget/KuCoin', () => {
+  const yes = ['binance', 'bybit', 'okx', 'bingx', 'kraken'].map((id) => new Exchange(id, {}).enableSandbox());
+  const no = ['htx', 'bitget', 'kucoin'].map((id) => new Exchange(id, {}).enableSandbox());
+  assert.deepEqual(yes, [true, true, true, true, true]);
+  assert.deepEqual(no, [false, false, false]);
+});

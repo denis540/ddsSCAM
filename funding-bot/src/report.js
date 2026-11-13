@@ -70,7 +70,7 @@ function formatStatus(cfg, state, rates, lastScanAt) {
   const today = state.day();
   const openU = state.positions.reduce((a, p) => a + unrealized(p, rates).total, 0);
   return (
-    `🤖 Режим: ${cfg.mode.toUpperCase()}${cfg.paused ? ' — ⏸ ПАУЗА (нові входи вимкнено)' : ''}\n` +
+    `🤖 Режим: ${cfg.mode.toUpperCase()}${cfg.sandbox ? ' (тестові мережі)' : ''}${cfg.paused ? ` — ⏸ ПАУЗА (нові входи вимкнено)${cfg.pauseReason ? `: ${cfg.pauseReason}` : ''}` : ''}\n` +
     `Біржі: ${cfg.exchanges.join(', ')}\n` +
     `Розмір: ${cfg.sizeMode === 'auto' ? `авто за стаканами, маржа до ${cfg.maxTradeUsdt} ${cfg.quote} × плече на кожній біржі (мін. позиція ${cfg.minTradeUsdt})` : cfg.sizeMode === 'coins' ? `монети (${Object.keys(cfg.coinQty).length} налаштовано, /qty)` : `${cfg.positionUsdt} ${cfg.quote}`}, плече x${cfg.leverage}\n` +
     `Поріг: фандінг > ${pct(cfg.minFunding)}, чистий > ${pct(cfg.minProfit)}\n` +

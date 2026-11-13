@@ -1,0 +1,23 @@
+# systemd: альтернатива pm2.
+#   sudo cp deploy/funding-bot.service /etc/systemd/system/
+#   (виправте User і WorkingDirectory нижче)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now funding-bot
+#   journalctl -u funding-bot -f      # логи
+[Unit]
+Description=Funding arbitrage bot
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/home/bot/funding-bot
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

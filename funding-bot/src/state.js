@@ -16,6 +16,7 @@ class State {
       stats: { realizedPnl: 0, fundingEarned: 0, feesPaid: 0, trades: 0, wins: 0 },
       daily: {},
       lastReportDay: undefined,
+      pending: [], // наміри угод: записуються ДО відправки ордерів (для звірки після падіння)
     };
     this.load();
   }
@@ -40,6 +41,17 @@ class State {
 
   get positions() {
     return this.data.positions;
+  }
+
+  setPending(p) {
+    this.data.pending = (this.data.pending || []).filter((x) => x.symbol !== p.symbol);
+    this.data.pending.push(p);
+    this.save();
+  }
+
+  clearPending(symbol) {
+    this.data.pending = (this.data.pending || []).filter((x) => x.symbol !== symbol);
+    this.save();
   }
 
   dayKey(ts = Date.now()) {

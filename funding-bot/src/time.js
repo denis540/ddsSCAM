@@ -29,3 +29,22 @@ function duration(ms) {
 
 module.exports.clock = clock;
 module.exports.duration = duration;
+
+/**
+ * Поправка годинника: різниця між часом бірж і локальним часом сервера.
+ * Виплати фандінгу відбуваються за часом біржі, тож усі таймінги бот рахує за nowSynced().
+ */
+let clockOffsetMs = 0;
+function setClockOffset(ms) {
+  clockOffsetMs = Number.isFinite(ms) ? ms : 0;
+}
+function getClockOffset() {
+  return clockOffsetMs;
+}
+function nowSynced() {
+  return Date.now() + clockOffsetMs;
+}
+
+module.exports.setClockOffset = setClockOffset;
+module.exports.getClockOffset = getClockOffset;
+module.exports.nowSynced = nowSynced;

@@ -22,7 +22,9 @@ async function setup() {
   const api = [];
   tg.send = async (text, chatId, markup) => { out.push({ text, markup }); };
   tg.api = async (m, b) => { api.push([m, b]); return {}; };
-  tg.ctx = { cfg, settings: new Settings(cfg, null), state: new State(null), trader: {}, keys: new KeyStore({}, null),
+  const trader = { openNotional: () => 0, withLock: (fn) => fn(), busy: new Set() };
+  const reconciler = { run: async () => ({ orphans: [], mismatches: [], autoClosed: [], failed: [] }), closeOrphan: async () => 'ok' };
+  tg.ctx = { cfg, settings: new Settings(cfg, null), state: new State(null), trader, reconciler, keys: new KeyStore({}, null),
     all: { okx }, exchanges: { okx }, initErrors: {}, coins: new CoinRegistry(cfg, null),
     getRates: () => ({ okx: { 'ETH/USDT:USDT': { rate: 0.001, intervalH: 8, mark: 100, nextTs: Date.now() + 1e5 } } }),
     getOpps: () => [], getLastScanAt: () => undefined };

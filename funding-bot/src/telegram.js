@@ -5,7 +5,7 @@ const R = require('./report');
 const { META, normalizeName, SUPPORTED } = require('./exchanges-meta');
 const { SCHEMA, display } = require('./settings');
 const { mask } = require('./keys');
-const { clock } = require('./time');
+const { clock, getClockOffset } = require('./time');
 
 /** Усі команди — одне джерело для меню Telegram (кнопка «Меню» біля поля вводу) і для /help. */
 const COMMANDS = [
@@ -30,6 +30,10 @@ const COMMANDS = [
     ['coinok', 'Довіряти монеті: /coinok X'],
     ['coinreset', 'Скинути ручне рішення: /coinreset X'],
     ['qty', 'Кількість монет для входу: /qty BTC 0.01'],
+  ]],
+  ['Захист коштів', [
+    ['safety', 'Стан захисту: стопи, ліміти, запобіжники'],
+    ['reconcile', 'Звірити позиції бота з біржами зараз'],
   ]],
   ['Налаштування і керування', [
     ['settings', 'Усі налаштування (змінювати кнопками)'],
@@ -84,6 +88,7 @@ const MAIN_MENU = inline([
   [btn('📜 Історія', 'c:/history'), btn('💵 Баланс', 'c:/balance')],
   [btn('🏦 Біржі і ключі', 'c:/exchanges'), btn('🪙 Монети', 'c:/coins')],
   [btn('⚙️ Налаштування', 'c:/settings'), btn('🔢 Кількість монет', 'c:/qty')],
+  [btn('🛡 Захист', 'c:/safety'), btn('🔄 Звірка з біржами', 'c:/reconcile')],
   [btn('⏸ Пауза', 'c:/pause'), btn('▶️ Старт', 'c:/resume')],
   [btn('🛑 Закрити позицію', 'closemenu'), btn('❓ Усі команди', 'c:/help')],
 ]);
@@ -351,6 +356,10 @@ class Telegram {
         return this.send(`Закрити всі ${state.positions.length} пар?`, chatId, inline([[btn('✅ Так, закрити всі', 'closeally'), btn('Ні', 'm')]]));
       case 'closeally':
         return this.handle('/closeall yes', chatId);
+      case 'orph': {
+        const r = await this.ctx.reconciler.closeOrphan(a);
+        return this.send(r, chatId, MAIN_MENU);
+      }
       default:
         return this.send('Невідома дія', chatId, MAIN_MENU);
     }
@@ -377,6 +386,37 @@ class Telegram {
     }
   }
 
+  safetyText() {
+    const { cfg, state, trader, all, guard } = this.ctx;
+    const p = (x, d = 0) => `${(x * 100).toFixed(d)}%`;
+    const day = state.day();
+    const s = state.data.stats;
+    const errs = guard ? guard.errors.length : 0;
+    const blocked = Object.values(all).filter((e) => e.tradeBlocked).map((e) => `${e.id}: ${e.tradeBlocked}`);
+    const ioc = Object.values(all).filter((e) => e.iocUnsupported).map((e) => e.id);
+    const stops = state.positions.flatMap((pos) => [['short', pos.shortEx], ['long', pos.longEx]].map(([k, ex]) => `${pos.symbol.split('/')[0]} ${ex} ${k}: ${pos[k].stopId ? `стоп ${R.fmt(pos[k].stopPrice, 8)}` : 'без стопу'}`));
+    return (
+      `🛡 Захист коштів (${cfg.mode.toUpperCase()}${cfg.sandbox ? ', ТЕСТОВІ МЕРЕЖІ' : ''})\n\n` +
+      `Стан: ${cfg.paused ? `⏸ ПАУЗА${cfg.pauseReason ? ` — ${cfg.pauseReason}` : ''}` : '▶️ працює'}\n\n` +
+      `Ордери: ${cfg.orderType === 'market' ? 'завжди ринкові' : 'бот обирає сам — лімітний IOC з межею ціни (слипедж ≤ ' + p(cfg.maxSlippagePct, 2) + '), ринковий для термінових закриттів'}` +
+      `${ioc.length ? `\n   IOC не приймають: ${ioc.join(', ')} → ринкові` : ''}\n` +
+      `Ліквідація: перевірка кожні ${cfg.liqCheckSec} с, бот закриває при ${p(cfg.liqClosePct)} шляху до ліквідації\n` +
+      `Стопи на біржах: ${cfg.protectStops ? `on, на ${p(cfg.stopAtPct)} шляху до ліквідації` : 'off'}\n` +
+      `${stops.length ? `${stops.map((x) => `   ${x}`).join('\n')}\n` : ''}` +
+      `Звірка з біржами: кожні ${cfg.reconcileMin} хв\n\n` +
+      `Запобіжники (автопауза):\n` +
+      `   збиток за день: ${day.pnl.toFixed(2)} / ліміт ${cfg.maxDailyLossUsdt > 0 ? `−${cfg.maxDailyLossUsdt}` : 'вимк.'}\n` +
+      `   збиткових поспіль: ${s.lossStreak || 0} / ${cfg.maxLossStreak || 'вимк.'}\n` +
+      `   помилок за 10 хв: ${errs} / ${cfg.maxErrors || 'вимк.'}\n\n` +
+      `Експозиція: зараз ${R.fmt(trader.openNotional(), 2)} ${cfg.quote}; ліміт загальний ${cfg.maxTotalUsdt || '—'}, на біржу ${cfg.maxExchangeUsdt || '—'}; резерв балансу ${p(cfg.reservePct)}\n` +
+      `Фільтр монет: обсяг ≥ ${Number(cfg.minVolumeUsdt).toLocaleString('uk-UA')} USDT/24 год, лістинг > ${cfg.newListingDays} дн, делістинг > ${cfg.delistDays} дн, ціни ±${p(cfg.coinPriceTol, 1)}\n` +
+      `Після виплати: чекати сходження цін до ${cfg.maxConvergeWaitMin} хв, якщо вихід зараз у мінус\n` +
+      `Годинник: поправка ${(getClockOffset() / 1000).toFixed(2)} с\n` +
+      `${blocked.length ? `⛔ Заблоковано: ${blocked.join('; ')}\n` : ''}` +
+      `Незавершених намірів угод: ${(state.data.pending || []).length}`
+    );
+  }
+
   // ---------- Монети ----------
 
   coinReport(coinRaw) {
@@ -396,7 +436,9 @@ class Telegram {
       return (
         `${coins && coins.isBanned(coin, ex.id) ? '🚫' : '•'} ${ex.title}: ${nat}${mult !== 1 ? ` (×${mult})` : ''}` +
         `${r ? `, ціна ${R.fmt(r.mark, 8)}, фандінг ${R.pct(r.rate, 4)}/${r.intervalH}h о ${r.nextTs ? clock(r.nextTs, tz) : '—'}` : ''}` +
-        `\n   адреси: ${addrTxt || 'немає даних'}`
+        `\n   адреси: ${addrTxt || 'немає даних'}` +
+        `${ex.tickers && ex.tickers[symbol] && ex.tickers[symbol].volumeUsdt ? `\n   обсяг 24 год: ${Math.round(ex.tickers[symbol].volumeUsdt).toLocaleString('uk-UA')} USDT` : ''}` +
+        `${this.ctx.marketProblem && this.ctx.marketProblem(coin, ex.id) ? `\n   ⛔ ${this.ctx.marketProblem(coin, ex.id)}` : ''}`
       );
     });
     const checks = [];
@@ -551,6 +593,7 @@ class Telegram {
           const b = await ex.balanceSummary();
           keys.set(id, creds);
           if (coins) coins.load(ex).catch(() => {}); // з ключем біржа може віддати адреси контрактів
+          if (this.ctx.checkPositionMode) await this.ctx.checkPositionMode(ex);
           return reply(`✅ Ключ ${ex.title} ${mask(creds.apiKey)} збережено і перевірено. Баланс: ${b.free.toFixed(2)} ${b.currency}\n(повідомлення з ключем видалено з чату)`);
         } catch (e) {
           ex.setCredentials(prev);
@@ -608,9 +651,26 @@ class Telegram {
       case '/pause':
         settings.setPaused(true);
         return reply('⏸ Пауза: нові позиції не відкриваються. Відкриті супроводжуються і закриваються за правилами.');
-      case '/resume':
+      case '/resume': {
+        const was = cfg.pauseReason;
+        if (this.ctx.guard) this.ctx.guard.resume();
+        cfg.pauseReason = undefined;
         settings.setPaused(false);
-        return reply('▶️ Входи відновлено');
+        return reply(`▶️ Входи відновлено${was ? ` (автопауза була: ${was})` : ''}`);
+      }
+      case '/reconcile': {
+        if (cfg.mode !== 'live') return reply('Звірка потрібна лише в LIVE-режимі (у PAPER реальних позицій немає).');
+        const r = await trader.withLock(() => this.ctx.reconciler.run());
+        const lines = [];
+        if (r.autoClosed.length) lines.push(`Закрито непарних ніг після збою: ${r.autoClosed.length}`);
+        if (r.orphans.length) lines.push(`Позицій на біржах, яких немає в боті: ${r.orphans.length} (див. повідомлення вище)`);
+        if (r.mismatches.length) lines.push(`Розбіжностей: ${r.mismatches.length}`);
+        if (r.failed && r.failed.length) lines.push(`Не відповіли: ${r.failed.join(', ')}`);
+        return reply(`🔄 Звірка з біржами
+${lines.length ? lines.join('\n') : '✅ Позиції бота збігаються з біржами'}`);
+      }
+      case '/safety':
+        return reply(this.safetyText(), inline([[btn('🔄 Звірити зараз', 'c:/reconcile'), btn('⚙️ Налаштування', 'c:/settings')], [btn('🏠 Меню', 'm')]]));
       case '/close': {
         if (!args[0]) return this.closeMenu(chatId);
         const pos = state.positions[Number(args[0]) - 1];

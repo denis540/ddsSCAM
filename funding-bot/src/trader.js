@@ -2,7 +2,7 @@
 
 const log = require('./logger');
 const { buildWindow, contrib } = require('./scanner');
-const { clock, duration } = require('./time');
+const { clock, duration, nowSynced } = require('./time');
 const { commonStep, floorToStep } = require('./exchange');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -70,7 +70,60 @@ class Trader {
     this.busy = new Set(); // символи, по яких зараз є угода
     this.skipped = new Map(); // вікна, які вже відхилили (щоб не спамити спробами кожен тік)
     this._lock = Promise.resolve();
-    this.now = () => Date.now();
+    this.now = () => nowSynced(); // час з поправкою на годинник бірж
+    this.guard = null; // аварійні запобіжники (guard.js)
+  }
+
+  async reportError(what) {
+    if (this.guard) await this.guard.onError(what);
+  }
+
+  /** Сума відкритих позицій (одна нога), USDT; exId — лише на цій біржі. */
+  openNotional(exId) {
+    let sum = 0;
+    for (const p of this.state.positions) {
+      if (!exId) sum += p.base * p.long.entry;
+      else {
+        if (p.shortEx === exId) sum += p.base * p.short.entry;
+        if (p.longEx === exId) sum += p.base * p.long.entry;
+      }
+    }
+    return sum;
+  }
+
+  /**
+   * Ордер з автоматичним вибором типу.
+   *  - лімітний IOC з межею ціни cap (не гірше за неї) — для звичайних входів і виходів:
+   *    захищає від проковзування, якщо стакан змінився за мить між перевіркою і ордером;
+   *  - ринковий — для термінових дій (відкат ноги, вирівнювання, ризик ліквідації, «сирота»),
+   *    якщо біржа не приймає IOC або ORDER_TYPE=market.
+   */
+  async sendOrder(ex, symbol, side, contracts, { cap, urgent = false, reduceOnly = false, leverage, marginMode } = {}) {
+    const opts = { reduceOnly, leverage, marginMode };
+    const useLimit = !urgent && cap > 0 && this.cfg.orderType !== 'market' && !ex.iocUnsupported;
+    if (useLimit) {
+      try {
+        const o = await ex.limitIOC(symbol, side, contracts, cap, opts);
+        return { ...o, type: 'limit' };
+      } catch (e) {
+        if (/timeinforce|time_in_force|\bioc\b|not support|unsupported|invalid order type|order type/i.test(e.message)) {
+          ex.iocUnsupported = true;
+          log.warn(`${ex.id}: лімітні IOC не приймаються (${e.message}) — далі ринкові ордери`);
+        } else {
+          throw e;
+        }
+      }
+    }
+    const o = await ex.marketOrder(symbol, side, contracts, opts);
+    return { ...o, type: 'market' };
+  }
+
+  /** Межа ціни для ордера за поточним стаканом: найкраща ціна ± допустимий слипедж. */
+  async priceCap(ex, symbol, side) {
+    const ob = await ex.fetchOrderBook(symbol);
+    const best = side === 'buy' ? ob.asks[0] && ob.asks[0][0] : ob.bids[0] && ob.bids[0][0];
+    if (!best) return undefined;
+    return side === 'buy' ? best * (1 + this.cfg.maxSlippagePct) : best * (1 - this.cfg.maxSlippagePct);
   }
 
   get paper() {
@@ -130,12 +183,13 @@ class Trader {
     return Math.max(1, Math.floor(Math.min(...caps)));
   }
 
-  orderLine(side, exId, symbol, base, contracts, price, fee) {
+  orderLine(side, exId, symbol, base, contracts, price, fee, type) {
     const cs = this.ex[exId].unitSize(symbol);
     const contractsTxt = cs !== 1 ? ` (${fmt(contracts, 6)} контр.)` : '';
+    const typeTxt = type === 'limit' ? ' [ліміт IOC]' : type === 'market' ? ' [ринок]' : type === 'mixed' ? ' [ліміт IOC + ринок]' : '';
     return (
       `${side === 'sell' ? '🔴 SELL' : '🟢 BUY'} ${fmt(base, 8)} ${coinOf(symbol)}${contractsTxt} @ ${fmt(price, 8)} на ${exId}` +
-      ` ≈ ${fmt(base * price, 2)} ${this.cfg.quote}, комісія ${fmt(fee, 4)}`
+      ` ≈ ${fmt(base * price, 2)} ${this.cfg.quote}, комісія ${fmt(fee, 4)}${typeTxt}`
     );
   }
 
@@ -183,9 +237,15 @@ class Trader {
     }
     if (!this.paper) {
       const [fS, fL] = await Promise.all([S.freeBalance(), L.freeBalance()]);
-      // вільний баланс × плече, 15% маржі лишаємо в запасі
-      limits[`баланс ${shortEx} ×${leverage}`] = (fS * leverage * 0.85) / mid;
-      limits[`баланс ${longEx} ×${leverage}`] = (fL * leverage * 0.85) / mid;
+      // вільний баланс × плече; резерв (reservePct) бот ніколи не використовує
+      const use = 1 - (cfg.reservePct ?? 0.15);
+      limits[`баланс ${shortEx} ×${leverage}`] = (fS * leverage * use) / mid;
+      limits[`баланс ${longEx} ×${leverage}`] = (fL * leverage * use) / mid;
+    }
+    if (cfg.maxTotalUsdt > 0) limits['загальний ліміт позицій'] = Math.max(0, cfg.maxTotalUsdt - this.openNotional()) / mid;
+    if (cfg.maxExchangeUsdt > 0) {
+      limits[`ліміт біржі ${shortEx}`] = Math.max(0, cfg.maxExchangeUsdt - this.openNotional(shortEx)) / mid;
+      limits[`ліміт біржі ${longEx}`] = Math.max(0, cfg.maxExchangeUsdt - this.openNotional(longEx)) / mid;
     }
     const coinCap = cfg.coinQty[coinOf(symbol)];
     if (cfg.sizeMode === 'auto') {
@@ -251,6 +311,7 @@ class Trader {
     const L = this.ex[longEx];
     if (!S || !L) return false;
     if (!this.paper && (!S.hasKeys || !L.hasKeys)) return false; // торгуємо лише там, де додано API-ключі
+    if (!this.paper && (S.tradeBlocked || L.tradeBlocked)) return false; // напр. hedge mode
     this.busy.add(symbol);
     const skip = (why) => {
       this.skipped.set(key, win.startTs);
@@ -312,8 +373,17 @@ class Trader {
       }
       if (this.now() > win.startTs - this.cfg.entryMinSec * 1000) return skip('не встигли до виплати');
 
-      // 3) Відкриття обох ніг
-      const legs = await this.executeOpen(symbol, S, L, sizing, pxS, pxL, leverage);
+      // 3) Відкриття обох ніг. Намір записуємо ДО ордерів: якщо бот впаде посередині,
+      //    звірка після перезапуску знайде і закриє непарну ногу.
+      const slip = this.cfg.maxSlippagePct;
+      const caps = { capS: bidS * (1 - slip), capL: askL * (1 + slip) };
+      this.state.setPending({ symbol, shortEx, longEx, ts: this.now() });
+      let legs;
+      try {
+        legs = await this.executeOpen(symbol, S, L, sizing, pxS, pxL, leverage, caps);
+      } finally {
+        this.state.clearPending(symbol);
+      }
       if (!legs) return skip('не вдалося відкрити');
 
       const openedAt = this.now();
@@ -327,6 +397,7 @@ class Trader {
         short: { contracts: legs.short.filled, entry: legs.short.average },
         long: { contracts: legs.long.filled, entry: legs.long.average },
         openedAt,
+        convergeWaitNotified: false,
         startTs: fresh.startTs,
         endTs: fresh.endTs,
         exitAt: fresh.endTs + this.cfg.exitAfterSec * 1000,
@@ -343,8 +414,8 @@ class Trader {
       await this.notify(
         `✅ ВХІД ${symbol}${this.paper ? ' [PAPER]' : ''} — під фандінг о ${clock(pos.startTs, this.cfg.timezone)}` +
           `${pos.endTs !== pos.startTs ? `–${clock(pos.endTs, this.cfg.timezone)}` : ''}\n` +
-          `${this.orderLine('sell', shortEx, symbol, pos.base, pos.short.contracts, pos.short.entry, legs.shortFee)}\n` +
-          `${this.orderLine('buy', longEx, symbol, pos.base, pos.long.contracts, pos.long.entry, legs.longFee)}\n` +
+          `${this.orderLine('sell', shortEx, symbol, pos.base, pos.short.contracts, pos.short.entry, legs.shortFee, legs.shortType)}\n` +
+          `${this.orderLine('buy', longEx, symbol, pos.base, pos.long.contracts, pos.long.entry, legs.longFee, legs.longType)}\n` +
           `Кількість: ${fmt(pos.base, 8)} ${coinOf(symbol)} — однакова на обох біржах (крок ${fmt(cap.step, 8)})\n` +
           `Розмір: ${fmt(notional, 2)} ${this.cfg.quote}, плече x${leverage} на обох → маржа ~${fmt(notional / leverage, 2)} на кожній біржі` +
           `${this.cfg.sizeMode === 'auto' ? '' : ` (режим ${this.cfg.sizeMode})`}\n` +
@@ -356,6 +427,7 @@ class Trader {
           `Вихід: ~${clock(pos.exitAt, this.cfg.timezone)} або раніше, коли ціни зійдуться`
       );
       this.skipped.set(key, win.startTs);
+      if (!this.paper && this.cfg.protectStops) await this.placeProtection(pos);
       return true;
     } catch (e) {
       log.error(`${symbol}: помилка відкриття: ${e.message}`);
@@ -366,10 +438,11 @@ class Trader {
     }
   }
 
-  async executeOpen(symbol, S, L, sizing, pxS, pxL, leverage = this.cfg.leverage) {
+  async executeOpen(symbol, S, L, sizing, pxS, pxL, leverage = this.cfg.leverage, caps = {}) {
     if (this.paper) {
       const shortFee = sizing.base * pxS * S.takerFee(symbol);
       const longFee = sizing.base * pxL * L.takerFee(symbol);
+      const type = this.cfg.orderType === 'market' ? 'market' : 'limit';
       return {
         base: sizing.base,
         short: { filled: sizing.cS, average: pxS },
@@ -377,13 +450,16 @@ class Trader {
         shortFee,
         longFee,
         fees: shortFee + longFee,
+        shortType: type,
+        longType: type,
       };
     }
-    // Обидві ноги паралельно — мінімізуємо час, коли позиція не захеджована
+    // Обидві ноги паралельно — мінімізуємо час, коли позиція не захеджована.
+    // Тип ордера бот обирає сам (sendOrder): лімітний IOC з межею ціни або ринковий.
     const opts = { leverage, marginMode: this.cfg.marginMode };
     const [rs, rl] = await Promise.allSettled([
-      S.marketOrder(symbol, 'sell', sizing.cS, opts),
-      L.marketOrder(symbol, 'buy', sizing.cL, opts),
+      this.sendOrder(S, symbol, 'sell', sizing.cS, { ...opts, cap: caps.capS }),
+      this.sendOrder(L, symbol, 'buy', sizing.cL, { ...opts, cap: caps.capL }),
     ]);
     if (rs.status === 'fulfilled' && rl.status === 'fulfilled') {
       const short = rs.value;
@@ -394,31 +470,30 @@ class Trader {
       const longFee = long.fee ?? L.contractsToBase(symbol, long.filled) * long.average * L.takerFee(symbol);
       const base = await this.equalizeLegs(symbol, S, L, short, long);
       if (!(base > 0)) {
-        await this.notify(`⚠️ ${symbol}: після вирівнювання ніг позиції не лишилось — вхід скасовано`);
+        const why = short.filled > 0 || long.filled > 0 ? 'після вирівнювання ніг позиції не лишилось' : 'лімітні ордери не виконались у межах ціни (стакан змінився)';
+        await this.notify(`ℹ️ ${symbol}: вхід скасовано — ${why}. Збитку немає, крім можливих комісій.`);
         return undefined;
       }
-      return { base, short, long, shortFee, longFee, fees: shortFee + longFee };
+      return { base, short, long, shortFee, longFee, fees: shortFee + longFee, shortType: short.type, longType: long.type };
     }
-    // Одна нога не відкрилась — відкатуємо іншу
+    // Одна нога не відкрилась — відкатуємо іншу (терміново, ринком)
     const failed = [];
     if (rs.status === 'rejected') failed.push(`SHORT ${S.id}: ${rs.reason && rs.reason.message}`);
     if (rl.status === 'rejected') failed.push(`LONG ${L.id}: ${rl.reason && rl.reason.message}`);
     const rollback = [];
-    if (rs.status === 'fulfilled') {
-      const o = await this.closeLegWithRetry(S, symbol, 'buy', rs.value.filled, opts);
-      if (o) rollback.push(this.orderLine('buy', S.id, symbol, S.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
-    }
-    if (rl.status === 'fulfilled') {
-      const o = await this.closeLegWithRetry(L, symbol, 'sell', rl.value.filled, opts);
-      if (o) rollback.push(this.orderLine('sell', L.id, symbol, L.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
+    for (const [r, ex, side] of [[rs, S, 'buy'], [rl, L, 'sell']]) {
+      if (r.status !== 'fulfilled' || !(r.value.filled > 0)) continue;
+      const o = await this.closeLegWithRetry(ex, symbol, side, r.value.filled, { ...opts, urgent: true });
+      if (o) rollback.push(this.orderLine(side, ex.id, symbol, ex.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee, o.type));
     }
     await this.notify(`⚠️ ${symbol}: не вдалося відкрити пару, відкат.\n${failed.join('\n')}${rollback.length ? `\nВідкат:\n${rollback.join('\n')}` : ''}`);
+    await this.reportError(`не вдалося відкрити ${symbol}: ${failed.join('; ')}`);
     return undefined;
   }
 
   /**
    * Біржі могли виконати ордери не повністю. Доводимо обидві ноги до ОДНАКОВОЇ кількості монет:
-   * найбільше кратне спільного кроку, що ≤ меншої ноги; зайве закриваємо reduceOnly.
+   * найбільше кратне спільного кроку, що ≤ меншої ноги; зайве закриваємо терміново (ринком).
    * @returns {Promise<number>} кількість монет на кожній нозі
    */
   async equalizeLegs(symbol, S, L, short, long) {
@@ -433,52 +508,120 @@ class Trader {
       if (extra <= 0) continue;
       const c = ex.baseToContracts(symbol, extra);
       if (!(c > 0)) continue;
-      try {
-        const o = await this.closeLegWithRetry(ex, symbol, side, c, {}, 3);
-        if (!o) continue;
-        leg.filled = Number((leg.filled - o.filled).toPrecision(12));
-        lines.push(this.orderLine(side, ex.id, symbol, ex.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
-      } catch (e) {
-        lines.push(`помилка на ${ex.id}: ${e.message}`);
-      }
+      const o = await this.closeLegWithRetry(ex, symbol, side, c, { urgent: true }, 3);
+      if (!o) continue;
+      leg.filled = Number((leg.filled - o.filled).toPrecision(12));
+      lines.push(this.orderLine(side, ex.id, symbol, ex.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee, o.type));
     }
     const fS = S.contractsToBase(symbol, short.filled);
     const fL = L.contractsToBase(symbol, long.filled);
-    await this.notify(
-      `⚖️ ${symbol}: біржі виконали різну кількість (${fmt(bS, 8)} / ${fmt(bL, 8)}), вирівнюю до ${fmt(target, 8)}\n${lines.join('\n')}` +
-        (fS !== fL ? `\n🚨 Ноги досі різні: ${S.id} ${fmt(fS, 8)}, ${L.id} ${fmt(fL, 8)} — перевірте вручну!` : '')
-    );
+    if (bS > 0 || bL > 0) {
+      await this.notify(
+        `⚖️ ${symbol}: біржі виконали різну кількість (${fmt(bS, 8)} / ${fmt(bL, 8)}), вирівнюю до ${fmt(target, 8)}\n${lines.join('\n')}` +
+          (fS !== fL ? `\n🚨 Ноги досі різні: ${S.id} ${fmt(fS, 8)}, ${L.id} ${fmt(fL, 8)} — перевірте вручну!` : '')
+      );
+    }
+    if (fS !== fL) await this.reportError(`${symbol}: не вдалося вирівняти ноги`);
     return Math.min(fS, fL);
   }
 
   /**
-   * Закриття (reduceOnly) з повторами. Якщо біржа виконала частково — дозакриває залишок.
-   * @returns {Promise<{filled:number, average:number, fee:number|undefined}|undefined>}
+   * Закриття ноги (reduceOnly) з повторами, доки не закриється вся кількість.
+   * Звичайне закриття: до 2 спроб лімітним IOC з межею ціни за свіжим стаканом, далі — ринком
+   * (вийти треба гарантовано). Термінове (urgent): одразу ринком.
+   * @returns {Promise<{filled:number, average:number, fee:number|undefined, type:string}|undefined>}
    */
-  async closeLegWithRetry(exchange, symbol, side, contracts, opts = {}, attempts = 4) {
+  async closeLegWithRetry(exchange, symbol, side, contracts, opts = {}, attempts = 5) {
     let left = contracts;
     let filled = 0;
     let cost = 0;
     let fee;
-    for (let i = 1; i <= attempts && left > 0; i++) {
+    const types = new Set();
+    let limitTries = opts.urgent ? 0 : 2;
+    for (let i = 1; i <= attempts + limitTries && left > 0; i++) {
       try {
-        const o = await exchange.marketOrder(symbol, side, left, { ...opts, reduceOnly: true });
+        let cap;
+        if (limitTries > 0) {
+          limitTries -= 1;
+          cap = await this.priceCap(exchange, symbol, side).catch(() => undefined);
+        }
+        const o = await this.sendOrder(exchange, symbol, side, left, { ...opts, reduceOnly: true, cap, urgent: !cap });
         const f = Math.min(o.filled || 0, left);
+        if (f > 0) types.add(o.type);
         filled = Number((filled + f).toPrecision(12));
         cost += f * (o.average || 0);
         if (o.fee !== undefined) fee = (fee || 0) + o.fee;
         left = Number((left - f).toPrecision(12));
-        if (left > 0) log.warn(`${exchange.id} ${symbol}: закрито частково, лишилось ${left} контр. — дозакриваю`);
+        if (left > 0 && f > 0) log.warn(`${exchange.id} ${symbol}: закрито частково, лишилось ${left} контр. — дозакриваю`);
       } catch (e) {
-        log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}/${attempts}: ${e.message}`);
-        await sleep(500 * 2 ** i);
+        log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}: ${e.message}`);
+        await sleep(500 * 2 ** Math.min(i, 4));
       }
     }
     if (left > 0) {
-      await this.notify(`🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ${filled > 0 ? `залишок ${left} контр. ` : ''}ноги на ${exchange.id}! Потрібне ручне втручання.`);
+      await this.notify(`🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ${filled > 0 ? `залишок ${left} контр. ` : ''}ноги на ${exchange.id}! Бот повторить спробу, перевірте біржу.`);
+      await this.reportError(`${symbol}: не вдалося закрити ногу на ${exchange.id}`);
       return undefined;
     }
-    return { filled, average: filled > 0 ? cost / filled : undefined, fee };
+    const type = types.size > 1 ? 'mixed' : [...types][0];
+    return { filled, average: filled > 0 ? cost / filled : undefined, fee, type };
+  }
+
+  /** Оцінка ціни ліквідації ноги, якщо біржа її не дала (ізольована маржа ~1/плече). */
+  estimateLiq(pos, legKey) {
+    const lev = pos.leverage || this.cfg.leverage;
+    const e = pos[legKey].entry;
+    return legKey === 'short' ? e * (1 + 1 / lev) : e * (1 - 1 / lev);
+  }
+
+  /**
+   * Захисні стоп-ордери на самих біржах: на stopAtPct шляху від входу до ліквідації кожної ноги.
+   * Спрацюють, навіть якщо бот упав або зник інтернет. Бот сам закриває раніше (liqClosePct).
+   */
+  async placeProtection(pos) {
+    const lines = [];
+    const legs = [['short', pos.shortEx, 'buy'], ['long', pos.longEx, 'sell']];
+    await Promise.all(
+      legs.map(async ([legKey, exId, side]) => {
+        const ex = this.ex[exId];
+        const leg = pos[legKey];
+        try {
+          let liq;
+          try {
+            const p = await ex.fetchPosition(pos.symbol);
+            if (p && p.liquidationPrice > 0) liq = p.liquidationPrice / (ex.mult[pos.symbol] || 1);
+          } catch (e) {
+            log.debug(`${exId} fetchPosition: ${e.message}`);
+          }
+          leg.liq = liq || this.estimateLiq(pos, legKey);
+          const stop = leg.entry + (leg.liq - leg.entry) * this.cfg.stopAtPct;
+          const o = await ex.placeStop(pos.symbol, side, leg.contracts, stop);
+          leg.stopId = o.id;
+          leg.stopPrice = stop;
+          lines.push(`🛡 ${exId} ${legKey.toUpperCase()}: стоп ${fmt(stop, 8)} (ліквідація ~${fmt(leg.liq, 8)})`);
+        } catch (e) {
+          lines.push(`⚠️ ${exId} ${legKey.toUpperCase()}: стоп не поставлено — ${e.message.slice(0, 120)}`);
+          await this.reportError(`${pos.symbol}: стоп на ${exId} не поставлено`);
+        }
+      })
+    );
+    this.state.save();
+    await this.notify(`${pos.symbol}: захисні стопи на біржах\n${lines.join('\n')}`);
+  }
+
+  async cancelProtection(pos) {
+    await Promise.all(
+      [['short', pos.shortEx], ['long', pos.longEx]].map(async ([legKey, exId]) => {
+        const leg = pos[legKey];
+        if (!leg.stopId) return;
+        try {
+          await this.ex[exId].cancelStop(pos.symbol, leg.stopId);
+        } catch (e) {
+          log.warn(`${exId}: не вдалося скасувати стоп ${leg.stopId}: ${e.message}`);
+        }
+        leg.stopId = undefined;
+      })
+    );
   }
 
   /**
@@ -524,29 +667,74 @@ class Trader {
     return { askS, bidL, exitBasis, pricePnl, closeFees };
   }
 
+  /**
+   * До якого моменту після виплати можна чекати, поки ціни зійдуться: exitAt + maxConvergeWaitMin,
+   * але не пізніше ніж за хвилину до наступної виплати на будь-якій з бірж (вона може бути проти нас).
+   */
+  convergeDeadline(pos, ratesByExchange) {
+    const waitMs = (this.cfg.maxConvergeWaitMin || 0) * 60000;
+    if (!waitMs) return pos.exitAt;
+    let deadline = pos.exitAt + waitMs;
+    for (const exId of [pos.shortEx, pos.longEx]) {
+      const r = ratesByExchange[exId] && ratesByExchange[exId][pos.symbol];
+      const iv = ((r && r.intervalH) || 8) * 3600000;
+      const next = r && r.nextTs > pos.endTs + 1000 ? r.nextTs : pos.endTs + iv;
+      deadline = Math.min(deadline, next - 60000);
+    }
+    return Math.max(deadline, pos.exitAt);
+  }
+
   /** Перевірка всіх позицій: нарахування, вихід після виплати / при сходженні цін / ризик. */
   async manage(ratesByExchange) {
     const now = this.now();
     for (const pos of [...this.state.positions]) {
       try {
         if (pos.closeError) {
-          await this.closePair(pos, `повторна спроба закриття (${pos.closeError})`);
+          await this.closePair(pos, `повторна спроба закриття (${pos.closeError})`, undefined, { urgent: true });
           continue;
+        }
+        // Ризик ліквідації — першим, кожні liqCheckSec (за замовчуванням 5 с)
+        const every = (this.cfg.liqCheckSec ?? 5) * 1000;
+        if (!pos.lastRiskCheck || now - pos.lastRiskCheck >= every - 500) {
+          pos.lastRiskCheck = now;
+          const risk = await this.liquidationRisk(pos, ratesByExchange);
+          if (risk) {
+            await this.closePair(pos, risk.reason, undefined, { urgent: true, missing: risk.missing });
+            continue;
+          }
         }
         this.processEvents(pos, ratesByExchange);
         const pending = (pos.events || []).filter((e) => !e.paid);
         const mark = ratesByExchange[pos.longEx]?.[pos.symbol]?.mark || pos.long.entry;
 
         if (!pending.length) {
-          // Усі виплати отримано: вихід, як тільки ціни зійшлися, або через exitAfterSec
-          if (now >= (pos.exitAt ?? 0)) {
-            await this.closePair(pos, `${duration(now - pos.endTs)} після виплати`);
+          // Усі виплати отримано
+          const deadline = this.convergeDeadline(pos, ratesByExchange);
+          if (now >= deadline) {
+            const waited = deadline > pos.exitAt ? ', ціни так і не зійшлися' : '';
+            await this.closePair(pos, `${duration(now - pos.endTs)} після виплати${waited}`);
             continue;
           }
           const q = await this.exitQuote(pos);
           if (q && q.exitBasis <= this.cfg.convergePct) {
             await this.closePair(pos, `ціни зійшлися (різниця ${pct(q.exitBasis)}) після виплати`, q);
             continue;
+          }
+          if (q && now >= pos.exitAt) {
+            // Час вийшов, але ціни не зійшлися: виходимо, лише якщо угода вже в плюсі; інакше чекаємо сходження
+            const total = q.pricePnl - q.closeFees + pos.fundingAccrued - pos.feesPaid;
+            if (total >= 0) {
+              await this.closePair(pos, `угода в плюсі ${sgn(total)} — фіксую`, q);
+              continue;
+            }
+            if (!pos.convergeWaitNotified) {
+              pos.convergeWaitNotified = true;
+              this.state.save();
+              await this.notify(
+                `⏳ ${pos.symbol}: виплату отримано, але ціни не зійшлися — вихід зараз дав би ${sgn(total)} ${this.cfg.quote}.\n` +
+                  `Позиція захеджована, чекаю сходження до ${clock(deadline, this.cfg.timezone)}. Захист від ліквідації працює.`
+              );
+            }
           }
         } else {
           const remaining = pending.reduce((a, e) => a + contrib(e), 0) * pos.base * mark;
@@ -563,13 +751,6 @@ class Trader {
             }
           }
         }
-        // Ризик ліквідації — кожні liqCheckSec (за замовчуванням 5 с, тобто кожен тік)
-        const every = (this.cfg.liqCheckSec ?? 5) * 1000;
-        if (!pos.lastRiskCheck || now - pos.lastRiskCheck >= every - 500) {
-          pos.lastRiskCheck = now;
-          const risk = await this.liquidationRisk(pos, ratesByExchange);
-          if (risk) await this.closePair(pos, risk);
-        }
       } catch (e) {
         log.error(`${pos.symbol}: помилка супроводу: ${e.message}`);
       }
@@ -578,64 +759,77 @@ class Trader {
 
   /**
    * Чи не наближається якась нога до ліквідації. Обидві біржі перевіряються паралельно.
-   * Live — ціна ліквідації і mark з позиції на біржі; paper — оцінка за поточним стаканом і плечем.
+   * Ризик = частка шляху від ціни входу до ціни ліквідації, яку ціна вже пройшла.
+   * Live — ціна ліквідації і mark з позиції на біржі; paper — оцінка за стаканом і плечем.
+   * @returns {Promise<{reason:string, missing?:string[]}|undefined>}
    */
   async liquidationRisk(pos, ratesByExchange) {
-    const buf = this.cfg.liqBufferPct;
-    const legs = [[pos.shortEx, 'short'], [pos.longEx, 'long']];
-    if (this.paper) {
-      // Груба модель ізольованої маржі: ліквідація при русі ~1/leverage. Ціни — свіжі зі стакану.
-      const lev = pos.leverage || this.cfg.leverage;
-      const marks = await Promise.all(
-        legs.map(async ([exId]) => {
+    const limit = this.cfg.liqClosePct ?? 0.6;
+    const legs = [['short', pos.shortEx], ['long', pos.longEx]];
+    const progress = (legKey, mark, liq) => {
+      const e = pos[legKey].entry;
+      if (!(mark > 0) || !(liq > 0) || liq === e) return 0;
+      return (mark - e) / (liq - e);
+    };
+    const results = await Promise.all(
+      legs.map(async ([legKey, exId]) => {
+        const ex = this.ex[exId];
+        const leg = pos[legKey];
+        if (this.paper) {
+          let mark;
           try {
-            const ob = await this.ex[exId].fetchOrderBook(pos.symbol);
+            const ob = await ex.fetchOrderBook(pos.symbol);
             const b = ob.bids[0] && ob.bids[0][0];
             const a = ob.asks[0] && ob.asks[0][0];
-            if (b && a) return (a + b) / 2;
+            if (b && a) mark = (a + b) / 2;
           } catch (e) {
             log.debug(`${exId} orderbook ${pos.symbol}: ${e.message}`);
           }
-          return ratesByExchange[exId]?.[pos.symbol]?.mark;
-        })
-      );
-      const [markS, markL] = marks;
-      if (markS) {
-        const dist = (pos.short.entry * (1 + 1 / lev) - markS) / markS;
-        if (dist < buf) return `SHORT ${pos.shortEx}: до ліквідації ~${pct(Math.max(dist, 0), 1)}`;
-      }
-      if (markL) {
-        const dist = (markL - pos.long.entry * (1 - 1 / lev)) / markL;
-        if (dist < buf) return `LONG ${pos.longEx}: до ліквідації ~${pct(Math.max(dist, 0), 1)}`;
-      }
-      return undefined;
-    }
-    const results = await Promise.all(
-      legs.map(async ([exId, side]) => {
-        try {
-          const p = await this.ex[exId].fetchPosition(pos.symbol);
-          if (!p) return `позиція ${side} на ${exId} зникла (ліквідація/ручне закриття?)`;
-          if (p.liquidationPrice && p.markPrice) {
-            const dist = Math.abs(p.markPrice - p.liquidationPrice) / p.markPrice;
-            if (dist < buf) return `${side} ${exId}: до ліквідації ${pct(dist, 1)}`;
-          }
-        } catch (e) {
-          log.warn(`${exId} fetchPosition ${pos.symbol}: ${e.message}`);
+          mark = mark || ratesByExchange[exId]?.[pos.symbol]?.mark;
+          const pr = progress(legKey, mark, leg.liq || this.estimateLiq(pos, legKey));
+          return pr >= limit ? { reason: `${legKey.toUpperCase()} ${exId}: ціна пройшла ${pct(pr, 0)} шляху до ліквідації` } : undefined;
         }
+        if (!(leg.contracts > 0)) return undefined;
+        try {
+          const p = await ex.fetchPosition(pos.symbol);
+          if (!p) {
+            pos.missingChecks = (pos.missingChecks || 0) + 1;
+            return { reason: `позиція ${legKey.toUpperCase()} на ${exId} зникла (спрацював стоп / ліквідація / ADL / ручне закриття) — закриваю другу ногу`, missing: [legKey] };
+          }
+          const mult = ex.mult[pos.symbol] || 1;
+          const mark = p.markPrice ? p.markPrice / mult : undefined;
+          if (p.liquidationPrice > 0) leg.liq = p.liquidationPrice / mult;
+          const pr = progress(legKey, mark, leg.liq || this.estimateLiq(pos, legKey));
+          if (pr >= limit) return { reason: `${legKey.toUpperCase()} ${exId}: ціна пройшла ${pct(pr, 0)} шляху до ліквідації` };
+        } catch (e) {
+          pos.riskErrors = (pos.riskErrors || 0) + 1;
+          log.warn(`${exId} fetchPosition ${pos.symbol}: ${e.message}`);
+          if (pos.riskErrors === 6) await this.notify(`⚠️ ${pos.symbol}: ${exId} не відповідає ~30 с — не можу перевірити ризик ліквідації. Стопи на біржі стоять.`);
+          return undefined;
+        }
+        pos.riskErrors = 0;
         return undefined;
       })
     );
-    return results.find(Boolean);
+    const hits = results.filter(Boolean);
+    if (!hits.length) return undefined;
+    return { reason: hits.map((h) => h.reason).join('; '), missing: hits.flatMap((h) => h.missing || []) };
   }
 
-  /** Закриває пару тією ж кількістю монет, якою відкривали. */
-  async closePair(pos, reason, quote) {
+  /**
+   * Закриває пару тією ж кількістю монет, якою відкривали.
+   * @param {{urgent?:boolean, missing?:string[]}} [opt] urgent — одразу ринком; missing — ноги, яких уже немає на біржі
+   */
+  async closePair(pos, reason, quote, opt = {}) {
     const S = this.ex[pos.shortEx];
     const L = this.ex[pos.longEx];
     let exitS;
     let exitL;
     let feeS;
     let feeL;
+    let typeS;
+    let typeL;
+    const notes = [];
     try {
       if (this.paper) {
         const q = quote || (await this.exitQuote(pos));
@@ -644,17 +838,50 @@ class Trader {
         exitL = q.bidL;
         feeS = pos.base * exitS * S.takerFee(pos.symbol);
         feeL = pos.base * exitL * L.takerFee(pos.symbol);
+        typeS = typeL = opt.urgent || this.cfg.orderType === 'market' ? 'market' : 'limit';
       } else {
-        // Нога, закрита на попередній (частково невдалій) спробі, повторно не закривається
+        // Нога, якої вже немає на біржі (стоп/ліквідація/вручну), не закривається.
+        // Ціна її закриття: факт з історії угод біржі → поточна ціна стакану → ціна стопу.
+        for (const legKey of opt.missing || []) {
+          const leg = pos[legKey];
+          if (!(leg.contracts > 0)) continue;
+          const ex = legKey === 'short' ? S : L;
+          const side = legKey === 'short' ? 'buy' : 'sell';
+          let price;
+          let src = 'факт з біржі';
+          try {
+            price = await ex.lastClosePrice(pos.symbol, side, pos.openedAt);
+          } catch (e) {
+            log.debug(`${ex.id} fetchMyTrades: ${e.message}`);
+          }
+          if (!price) {
+            try {
+              const ob = await ex.fetchOrderBook(pos.symbol);
+              const lv = side === 'buy' ? ob.asks : ob.bids;
+              if (lv[0]) {
+                price = lv[0][0];
+                src = 'оцінка за стаканом';
+              }
+            } catch (e) {
+              log.debug(`${ex.id} orderbook: ${e.message}`);
+            }
+          }
+          if (!price) {
+            price = leg.stopPrice || leg.liq || leg.entry;
+            src = 'оцінка (ціна стопу)';
+          }
+          Object.assign(leg, { contracts: 0, exit: price, exitFee: 0, closedContracts: leg.contracts, exitEstimated: src !== 'факт з біржі' });
+          notes.push(`${legKey.toUpperCase()} закрила біржа, ціна ${fmt(price, 8)} (${src})`);
+        }
         const closeLeg = (ex, side, leg) =>
           leg.contracts > 0
-            ? this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts, { leverage: pos.leverage, marginMode: this.cfg.marginMode })
-            : Promise.resolve({ average: leg.exit, fee: leg.exitFee || 0, filled: 0 });
+            ? this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts, { leverage: pos.leverage, marginMode: this.cfg.marginMode, urgent: opt.urgent })
+            : Promise.resolve({ average: leg.exit, fee: leg.exitFee || 0, filled: 0, type: leg.exitType });
         const shortContracts = pos.short.contracts;
         const longContracts = pos.long.contracts;
         const [rs, rl] = await Promise.all([closeLeg(S, 'buy', pos.short), closeLeg(L, 'sell', pos.long)]);
-        if (rs && pos.short.contracts > 0) Object.assign(pos.short, { contracts: 0, exit: rs.average, exitFee: rs.fee, closedContracts: shortContracts });
-        if (rl && pos.long.contracts > 0) Object.assign(pos.long, { contracts: 0, exit: rl.average, exitFee: rl.fee, closedContracts: longContracts });
+        if (rs && pos.short.contracts > 0) Object.assign(pos.short, { contracts: 0, exit: rs.average, exitFee: rs.fee, exitType: rs.type, closedContracts: shortContracts });
+        if (rl && pos.long.contracts > 0) Object.assign(pos.long, { contracts: 0, exit: rl.average, exitFee: rl.fee, exitType: rl.type, closedContracts: longContracts });
         if (!rs || !rl) {
           // Часткове закриття: позицію лишаємо у стані, щоб не загубити незакриту ногу
           pos.closeError = reason;
@@ -665,6 +892,9 @@ class Trader {
         exitL = rl.average || pos.long.entry;
         feeS = rs.fee ?? pos.base * exitS * S.takerFee(pos.symbol);
         feeL = rl.fee ?? pos.base * exitL * L.takerFee(pos.symbol);
+        typeS = rs.type;
+        typeL = rl.type;
+        await this.cancelProtection(pos);
       }
     } catch (e) {
       log.error(`${pos.symbol}: помилка закриття: ${e.message}`);
@@ -698,8 +928,9 @@ class Trader {
     const paidEvents = (pos.events || []).filter((e) => e.paid);
     await this.notify(
       `❎ ВИХІД ${pos.symbol}${this.paper ? ' [PAPER]' : ''} — ${reason}\n` +
-        `${this.orderLine('buy', pos.shortEx, pos.symbol, pos.base, cS, exitS, feeS)}\n` +
-        `${this.orderLine('sell', pos.longEx, pos.symbol, pos.base, cL, exitL, feeL)}\n` +
+        `${this.orderLine('buy', pos.shortEx, pos.symbol, pos.base, cS, exitS, feeS, typeS)}\n` +
+        `${this.orderLine('sell', pos.longEx, pos.symbol, pos.base, cL, exitL, feeL, typeL)}\n` +
+        (notes.length ? `${notes.join('\n')}\n` : '') +
         `Утримання: ${duration(this.now() - pos.openedAt)}\n` +
         (paidEvents.length
           ? `Отримані виплати:\n${paidEvents.map((e) => `   ${clock(e.ts, this.cfg.timezone)} ${e.ex} ${e.side.toUpperCase()} ${pct(e.rate, 4)} → ${sgn(e.amount)}`).join('\n')}\n`
@@ -708,6 +939,7 @@ class Trader {
         `${pnl >= 0 ? '💰' : '🔻'} PnL угоди: ${sgn(pnl)} ${this.cfg.quote}\n` +
         `Загальний PnL: ${sgn(s.realizedPnl)} ${this.cfg.quote} (${s.trades} угод)`
     );
+    if (this.guard) await this.guard.onTradeClosed(pnl);
     return closed;
   }
 }

@@ -210,24 +210,27 @@ test('live: біржа без API-ключа — не торгуємо (лише
 });
 
 test('ризик ліквідації перевіряється кожні 5 с на обох біржах одночасно', async () => {
-  const { a, b, state, trader, rates, window, at, msgs } = await setup({ mode: 'live', leverage: 3, liqCheckSec: 5 });
+  const { a, b, state, trader, rates, window, at, msgs } = await setup({ mode: 'live', leverage: 3, liqCheckSec: 5, liqClosePct: 0.6 });
   assert.ok(await trader.tryOpen(await window()));
-  const sym = 'ETH/USDT:USDT';
   const calls = [];
-  const pos = (ex, liq) => async () => { calls.push(ex); return [{ symbol: sym, contracts: 1, markPrice: 100, liquidationPrice: liq }]; };
-  a.client.fetchPositions = pos('a', 130);
-  b.client.fetchPositions = pos('b', 70);
+  for (const [c, name] of [[a.client, 'a'], [b.client, 'b']]) {
+    const orig = c.fetchPositions.bind(c);
+    c.fetchPositions = async (...x) => { calls.push(name); return orig(...x); };
+  }
   a.client.price = 101; // щоб не спрацював вихід через сходження цін
+  b.client.liq = 70;
+  b.client.mark = 95; // лонг: вхід ~100, ліквідація 70 → пройдено ~17% шляху
   at(10000);
   await trader.manage(await rates());
   at(15000);
   await trader.manage(await rates());
   assert.deepEqual(calls, ['a', 'b', 'a', 'b'], 'дві перевірки за 5 с, кожна — обидві біржі');
   assert.equal(state.positions.length, 1);
-  // ціна наблизилась до ліквідації лонгу (до неї 10% < 15%)
-  b.client.fetchPositions = pos('b', 90);
+  b.client.mark = 81; // пройдено ~63% шляху до ліквідації (ліміт 60%)
   at(20000);
   await trader.manage(await rates());
   assert.equal(state.positions.length, 0);
-  assert.match(msgs.at(-1), /long b: до ліквідації 10\.0%/);
+  assert.match(msgs.at(-1), /LONG b: ціна пройшла 63% шляху до ліквідації/);
+  assert.ok(b.client.orders.at(-1).params.reduceOnly);
+  assert.equal(b.client.orders.at(-1).type, 'market', 'термінове закриття — ринком');
 });
