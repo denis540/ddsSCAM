@@ -449,3 +449,19 @@ test('3 збиткові угоди поспіль по монеті — мон�
   assert.ok(trader.coins.isBanned('ETH', 'a'));
   assert.match(msgs.at(-1), /автоматично додано в чорний список/);
 });
+
+test('самоперевірка не чіпає монети, по яких бот має позицію (one-way підсумував би угоди)', async () => {
+  const { a } = await setup();
+  const ETH = 'ETH/USDT:USDT';
+  a.client.markets['BTC/USDT:USDT'] = { ...a.client.markets[ETH], symbol: 'BTC/USDT:USDT', base: 'BTC' };
+  a.buildSymbolMap();
+  a.client.pos[ETH] = -1.5; // бойова позиція бота
+  const r = await a.runSelfTest({ full: true, avoid: [ETH] });
+  assert.ok(r.ok, JSON.stringify(r.checks));
+  assert.ok(a.client.orders.every((o) => o.s === 'BTC/USDT:USDT'), 'тест лише по BTC');
+  assert.equal(a.client.pos[ETH], -1.5, 'бойова позиція не змінилась');
+  // єдина монета зайнята — повний тест пропускається
+  const r2 = await a.runSelfTest({ full: true, avoid: [ETH, 'BTC/USDT:USDT'] });
+  assert.equal(r2.ok, false);
+  assert.match(r2.checks[0].info, /усі монети зайняті/);
+});

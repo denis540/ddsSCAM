@@ -604,7 +604,7 @@ class Exchange {
    * (коштує лише дві мінімальні комісії).
    * @returns {Promise<{ok:boolean, checks:Array<{name:string, ok:boolean, info:string}>}>}
    */
-  async runSelfTest({ full = false, symbol } = {}) {
+  async runSelfTest({ full = false, symbol, avoid = [] } = {}) {
     const checks = [];
     const step = async (name, fn, critical = true) => {
       try {
@@ -617,7 +617,16 @@ class Exchange {
       }
     };
     if (!this.hasKeys) return { ok: false, checks: [{ name: 'API-ключ', ok: false, critical: true, info: 'немає ключа' }] };
-    const sym = symbol || (this.native['BTC/USDT:USDT'] ? 'BTC/USDT:USDT' : this.perpSymbols()[0]);
+    // Монета для тесту — БЕЗ відкритих позицій бота на цій біржі: в one-way режимі тестова угода
+    // підсумувалась би з бойовою позицією і зіпсувала б хедж.
+    const busy = new Set(avoid);
+    const prefer = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT'];
+    const sym = symbol || prefer.concat(this.perpSymbols()).find((s) => this.native[s] && !busy.has(s));
+    if (!sym) return { ok: false, checks: [{ name: 'монета для тесту', ok: false, critical: false, info: 'усі монети зайняті позиціями' }] };
+    if (full) {
+      const p = await this.fetchPosition(sym).catch(() => undefined);
+      if (p) return { ok: false, checks: [{ name: 'монета для тесту', ok: false, critical: false, info: `на ${sym.split('/')[0]} вже є позиція — повну перевірку пропущено, щоб її не зачепити` }] };
+    }
     await step('баланс', async () => {
       const b = await this.balanceSummary();
       if (!(b.free > 0)) throw new Error(`вільний баланс ${b.free} ${b.currency}`);

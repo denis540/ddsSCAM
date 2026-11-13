@@ -743,7 +743,15 @@ class Telegram {
         const exs = Object.values(this.ctx.exchanges).filter((e) => e.hasKeys);
         if (!exs.length) return reply('Немає бірж з API-ключами.', inline([[btn('🏦 Додати ключі', 'c:/exchanges')]]));
         await reply(`🧪 Самоперевірка${full ? ' (повна)' : ''}: ${exs.map((e) => e.id).join(', ')}…`);
-        const out = await trader.withLock(() => Promise.all(exs.map(async (ex) => [ex, await ex.runSelfTest({ full })])));
+        const out = await trader.withLock(() =>
+          Promise.all(
+            exs.map(async (ex) => {
+              // монети, де бот має позицію на цій біржі, тест не чіпає
+              const avoid = state.positions.filter((p) => p.shortEx === ex.id || p.longEx === ex.id).map((p) => p.symbol);
+              return [ex, await ex.runSelfTest({ full, avoid })];
+            })
+          )
+        );
         const lines = out.map(([ex, r]) => {
           if (this.ctx.applySelfTest) this.ctx.applySelfTest(ex, r);
           return `${r.ok ? '✅' : '⛔'} ${ex.title}\n${r.checks.map((c) => `   ${c.ok ? '✓' : c.critical === false ? '⚠' : '✗'} ${c.name}: ${c.info}`).join('\n')}`;
