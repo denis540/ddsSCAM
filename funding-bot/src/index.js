@@ -19,6 +19,8 @@ const { KeyStore } = require('./keys');
 const { CoinRegistry } = require('./coins');
 const { Guard } = require('./guard');
 const { Reconciler } = require('./reconcile');
+const { acquireLock } = require('./lock');
+const { runBacktest } = require('./backtest');
 const { formatDailyReport } = require('./report');
 const { nowParts, clock, duration, nowSynced, setClockOffset } = require('./time');
 
@@ -49,6 +51,8 @@ function printTable(wins, n) {
 }
 
 async function main() {
+  // Лише одна копія бота: дві торгували б одним рахунком
+  if (!scanOnly) acquireLock(cfg.lockFile);
   const state = new State(cfg.stateFile, cfg.timezone);
   const settings = new Settings(cfg, cfg.settingsFile);
   const tg = new Telegram(cfg.telegram);
@@ -69,7 +73,7 @@ async function main() {
   log.info(`Старт. Режим: ${cfg.mode.toUpperCase()}${cfg.sandbox ? ' (ТЕСТОВІ МЕРЕЖІ)' : ''}${scanOnly ? ' (тільки сканування)' : ''}. Біржі: ${cfg.exchanges.join(', ')}`);
   if (cfg.mode === 'live' && !cfg.sandbox) log.warn('LIVE-режим: бот виставлятиме реальні ордери!');
 
-  const keys = new KeyStore(cfg.credentials, cfg.keysFile);
+  const keys = new KeyStore(cfg.credentials, cfg.keysFile, cfg.keysSecret);
   // all — усі налаштовані біржі (у т.ч. ті, що поки не підключились); exchanges — робочі
   const all = {};
   const exchanges = {};
@@ -154,6 +158,27 @@ async function main() {
   };
   await syncClock();
 
+  // ---- Live: фактичні комісії акаунта і самоперевірка кожної біржі з ключем ----
+  const applySelfTest = (ex, r) => {
+    const failed = r.checks.filter((c) => !c.ok && c.critical !== false).map((c) => `${c.name}: ${c.info}`);
+    if (failed.length) ex.tradeBlocked = `самоперевірка не пройдена — ${failed.join('; ')}`;
+    else if (ex.tradeBlocked && ex.tradeBlocked.startsWith('самоперевірка')) ex.tradeBlocked = undefined;
+  };
+  if (cfg.mode === 'live' && !scanOnly) {
+    const keyed = Object.values(exchanges).filter((e) => e.hasKeys);
+    await Promise.all(keyed.map((ex) => ex.loadAccountFees().catch((e) => log.debug(`${ex.id} fees: ${e.message}`))));
+    if (cfg.selfTestOnStart && keyed.length) {
+      const res = await Promise.all(keyed.map(async (ex) => [ex, await ex.runSelfTest().catch((e) => ({ ok: false, checks: [{ name: 'самоперевірка', ok: false, critical: true, info: e.message }] }))]));
+      for (const [ex, r] of res) applySelfTest(ex, r);
+      const bad = res.filter(([, r]) => !r.ok);
+      log.info(`Самоперевірка: ${res.map(([ex, r]) => `${ex.id} ${r.ok ? 'ok' : 'FAIL'}`).join(', ')}`);
+      if (bad.length) {
+        // повідомлення надішлемо після старту Telegram
+        state.pendingNotes = bad.map(([ex, r]) => `⛔ ${ex.title}: самоперевірка не пройдена — бот не торгує на цій біржі\n${r.checks.filter((c) => !c.ok).map((c) => `   ✗ ${c.name}: ${c.info}`).join('\n')}`);
+      }
+    }
+  }
+
   // ---- Перевірка монет: адреси контрактів + ризики ринку + обсяги ----
   const coins = new CoinRegistry(cfg, cfg.coinsFile);
   trader.coins = coins;
@@ -198,7 +223,8 @@ async function main() {
   if (!scanOnly) {
     await tg.start({
       cfg, settings, state, trader, keys, all, exchanges, initErrors, coins, guard, reconciler, marketProblem,
-      checkPositionMode,
+      checkPositionMode, applySelfTest,
+      runBacktest: (days) => runBacktest({ exchanges, cfg, days, maxCoins: 25 }),
       getRates: () => lastRates,
       getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
@@ -220,6 +246,8 @@ async function main() {
         `макс. збиток за день ${cfg.maxDailyLossUsdt || '—'}\n` +
         `Відкритих позицій: ${state.positions.length}\n/help — команди`
     );
+    for (const n of state.pendingNotes || []) await notify(n);
+    if (cfg.mode === 'live' && !cfg.telegram.pin) await notify('🔐 Порада: задайте TELEGRAM_PIN у .env — тоді зміна ключів, налаштувань і закриття позицій вимагатимуть PIN.');
   }
 
   // ---- Звірка з біржами: одразу після старту (знайде непарні ноги після збою) і далі періодично ----
@@ -281,6 +309,8 @@ async function main() {
     if (Date.now() - tickersAt > 5 * MIN) await refreshTickers();
     if (Date.now() - coinsLoadedAt > 6 * HOUR) refreshCoins();
     if (Date.now() - clockSyncedAt > HOUR) await syncClock();
+    if (Date.now() - statusAt > 5 * MIN) await checkStatuses();
+    if (Date.now() - imbalanceAt > 30 * MIN) await checkImbalance().catch((e) => log.debug(`imbalance: ${e.message}`));
     const rates = await fetchAllRates();
     let wins = planWindows(rates, cfg, takerFee, nowSynced(), coinCheck);
     // У режимі монет торгуємо лише ті монети, для яких задано кількість
@@ -289,6 +319,45 @@ async function main() {
     lastWindows = wins;
     lastScanAt = Date.now();
     printTable(wins, cfg.topN);
+  };
+
+  // ---- Техроботи на біржах: не входимо, поки біржа не в нормі ----
+  let statusAt = 0;
+  const checkStatuses = async () => {
+    statusAt = Date.now();
+    await Promise.all(
+      Object.values(exchanges).map(async (ex) => {
+        const was = ex.maintenance;
+        try {
+          await ex.checkStatus();
+        } catch (e) {
+          log.debug(`${ex.id} status: ${e.message}`);
+        }
+        if (ex.maintenance && !was) notify(`🛠 ${ex.title}: ${ex.maintenance} — нові входи на цій біржі призупинено`).catch(() => {});
+        if (!ex.maintenance && was) notify(`✅ ${ex.title}: техроботи завершено`).catch(() => {});
+      })
+    );
+  };
+
+  // ---- Перекіс балансів між біржами (live): попередження, щоб перекинути кошти вручну ----
+  let imbalanceAt = 0;
+  let imbalanceWarnedAt = 0;
+  const checkImbalance = async () => {
+    imbalanceAt = Date.now();
+    if (cfg.mode !== 'live' || !(cfg.imbalanceRatio > 0)) return;
+    const keyed = Object.values(exchanges).filter((e) => e.hasKeys && !e.tradeBlocked);
+    if (keyed.length < 2) return;
+    const bal = (await Promise.all(keyed.map(async (ex) => [ex, await ex.balanceSummary().catch(() => undefined)]))).filter(([, b]) => b);
+    if (bal.length < 2) return;
+    bal.sort((a, b) => b[1].total - a[1].total);
+    const [hi, lo] = [bal[0], bal[bal.length - 1]];
+    if (lo[1].total > 0 && hi[1].total / lo[1].total < cfg.imbalanceRatio) return;
+    if (Date.now() - imbalanceWarnedAt < 12 * HOUR) return;
+    imbalanceWarnedAt = Date.now();
+    await notify(
+      `⚖️ Баланси між біржами нерівні: ${bal.map(([ex, b]) => `${ex.id} ${b.total.toFixed(0)}`).join(', ')} ${cfg.quote}.\n` +
+        `На ${lo[0].title} угоди будуть меншими (або не відкриються). Варто перекинути частину коштів з ${hi[0].title} вручну.`
+    );
   };
 
   // ---- Пульс: «я працюю» в Telegram ----

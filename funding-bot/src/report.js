@@ -114,4 +114,70 @@ function formatHistory(state, n = 10, quote = 'USDT') {
     .join('\n');
 }
 
-module.exports = { formatPositions, formatOpps, formatStatus, formatDailyReport, formatHistory, unrealized, pct, fmt, sign };
+/** Статистика закритих угод: по парах бірж, монетах, проковзування, фандінг «розрахунок vs факт». */
+function formatStats(state, cfg, days = 30) {
+  const since = Date.now() - days * 86400000;
+  const list = state.data.closed.filter((c) => c.closedAt >= since);
+  if (!list.length) return `За ${days} дн закритих угод немає`;
+  const agg = (key) => {
+    const m = {};
+    for (const c of list) {
+      const k = key(c);
+      const a = (m[k] = m[k] || { n: 0, pnl: 0, wins: 0, funding: 0 });
+      a.n += 1;
+      a.pnl += c.pnl || 0;
+      a.funding += c.fundingAccrued || 0;
+      if (c.pnl > 0) a.wins += 1;
+    }
+    return Object.entries(m).sort((x, y) => y[1].pnl - x[1].pnl);
+  };
+  const row = ([k, a]) => `   ${k}: ${a.n} угод, PnL ${sign(a.pnl, 2)}, прибуткових ${Math.round((a.wins / a.n) * 100)}%`;
+  const avg = (xs) => (xs.length ? xs.reduce((x, y) => x + y, 0) / xs.length : undefined);
+  const se = avg(list.map((c) => c.slipEntry).filter(Number.isFinite));
+  const sx = avg(list.map((c) => c.slipExit).filter(Number.isFinite));
+  const total = list.reduce((a, c) => a + (c.pnl || 0), 0);
+  const wins = list.filter((c) => c.pnl > 0).length;
+  const fc = state.data.fundingCheck || {};
+  const fcLines = Object.entries(fc).map(([ex, l]) => {
+    const e = l.reduce((a, x) => a + x.expected, 0);
+    const f = l.reduce((a, x) => a + x.actual, 0);
+    return `   ${ex}: розрахунок ${sign(e, 4)}, факт ${sign(f, 4)}${l.some((x) => x.bad) ? ' ⚠️ були розбіжності' : ''}`;
+  });
+  const unconf = list.filter((c) => c.unconfirmedFunding).length;
+  return (
+    `📊 Статистика за ${days} дн\n\n` +
+    `Угод: ${list.length}, прибуткових ${Math.round((wins / list.length) * 100)}%, PnL ${sign(total, 2)} ${cfg.quote}\n` +
+    `Середня угода: ${sign(total / list.length, 4)} ${cfg.quote}\n` +
+    `Проковзування (+ гірше за очікуване): вхід ${se === undefined ? '—' : pct(se, 3)}, вихід ${sx === undefined ? '—' : pct(sx, 3)}\n` +
+    (unconf ? `Угод, де біржа не підтвердила фандінг вчасно: ${unconf}\n` : '') +
+    `\nПо парах бірж (SHORT/LONG):\n${agg((c) => `${c.shortEx}/${c.longEx}`).slice(0, 10).map(row).join('\n')}\n` +
+    `\nПо монетах:\n${agg((c) => c.symbol.split('/')[0]).slice(0, 10).map(row).join('\n')}\n` +
+    `\nНайгірші монети:\n${agg((c) => c.symbol.split('/')[0]).slice(-5).reverse().filter(([, a]) => a.pnl < 0).map(row).join('\n') || '   —'}` +
+    (fcLines.length ? `\n\nФандінг: розрахунок vs факт (останні угоди):\n${fcLines.join('\n')}` : '')
+  );
+}
+
+/** Закриті угоди у CSV (для обліку і податків). */
+function tradesCsv(state, days = 30) {
+  const since = Date.now() - days * 86400000;
+  const head = ['closed_at_utc', 'opened_at_utc', 'symbol', 'short_exchange', 'long_exchange', 'quantity', 'leverage',
+    'entry_short', 'entry_long', 'exit_short', 'exit_long', 'funding', 'fees', 'price_pnl', 'pnl', 'slippage_entry_pct',
+    'slippage_exit_pct', 'mode', 'reason'];
+  const esc = (v) => {
+    const t = v === undefined || v === null ? '' : String(v);
+    return /[",\n;]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const iso = (ts) => (ts ? new Date(ts).toISOString() : '');
+  const rows = state.data.closed
+    .filter((c) => c.closedAt >= since)
+    .map((c) => [
+      iso(c.closedAt), iso(c.openedAt), c.symbol.split('/')[0], c.shortEx, c.longEx, c.base, c.leverage,
+      c.short && c.short.entry, c.long && c.long.entry, c.exitShort, c.exitLong,
+      (c.fundingAccrued || 0).toFixed(6), ((c.feesPaid || 0) + (c.closeFees || 0)).toFixed(6), (c.pricePnl || 0).toFixed(6), (c.pnl || 0).toFixed(6),
+      c.slipEntry === undefined ? '' : (c.slipEntry * 100).toFixed(4), c.slipExit === undefined ? '' : (c.slipExit * 100).toFixed(4),
+      c.paper ? 'paper' : 'live', c.reason,
+    ].map(esc).join(','));
+  return `${head.join(',')}\n${rows.join('\n')}\n`;
+}
+
+module.exports = { formatStats, tradesCsv, formatPositions, formatOpps, formatStatus, formatDailyReport, formatHistory, unrealized, pct, fmt, sign };

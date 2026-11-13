@@ -311,7 +311,8 @@ class Trader {
     const L = this.ex[longEx];
     if (!S || !L) return false;
     if (!this.paper && (!S.hasKeys || !L.hasKeys)) return false; // торгуємо лише там, де додано API-ключі
-    if (!this.paper && (S.tradeBlocked || L.tradeBlocked)) return false; // напр. hedge mode
+    if (!this.paper && (S.tradeBlocked || L.tradeBlocked)) return false; // hedge mode, самоперевірка, розбіжність фандінгу
+    if (S.maintenance || L.maintenance) return false; // техроботи на біржі — можна не закрити позицію
     this.busy.add(symbol);
     const skip = (why) => {
       this.skipped.set(key, win.startTs);
@@ -321,6 +322,8 @@ class Trader {
     try {
       // 1) Свіжі ставки прямо перед входом — прогнозна ставка може змінитися аж до виплати
       const [rS, rL] = await Promise.all([S.fetchFundingRate(symbol), L.fetchFundingRate(symbol)]);
+      // фактичні комісії вашого акаунта (VIP-рівень, знижки), а не базові
+      if (!this.paper) await Promise.all([S.ensureFee(symbol), L.ensureFee(symbol)]);
       const fees = 2 * (S.takerFee(symbol) + L.takerFee(symbol));
       const fresh = rS && rL && buildWindow({ symbol, shortEx, longEx, s: rS, l: rL, startTs: win.startTs, endTs: win.endTs, now, cfg: this.cfg, fees });
       if (!fresh) return skip('час виплати змінився');
@@ -398,6 +401,7 @@ class Trader {
         long: { contracts: legs.long.filled, entry: legs.long.average },
         openedAt,
         convergeWaitNotified: false,
+        expectedEntry: { short: pxS, long: pxL },
         startTs: fresh.startTs,
         endTs: fresh.endTs,
         exitAt: fresh.endTs + this.cfg.exitAfterSec * 1000,
@@ -653,6 +657,67 @@ class Trader {
     return changed;
   }
 
+  /**
+   * Live: виплата вважається отриманою, лише коли біржа показала нарахування в історії фандінгу
+   * (або минуло fundingConfirmSec — тоді оцінка). Поки не підтверджено — не виходимо (крім ризику ліквідації).
+   * Фактичну суму порівнюємо з розрахунком: систематична розбіжність на біржі → торгівлю на ній блокуємо.
+   */
+  async confirmEvents(pos, ratesByExchange) {
+    const now = this.now();
+    let changed = false;
+    for (const ev of pos.events || []) {
+      if (ev.paid) continue;
+      const r = ratesByExchange[ev.ex] && ratesByExchange[ev.ex][pos.symbol];
+      if (r && ev.ts > now && r.nextTs && Math.abs(r.nextTs - ev.ts) < 60000) {
+        ev.rate = r.rate;
+        ev.est = false;
+      }
+      if (now < ev.ts + this.cfg.settleDelaySec * 1000) continue;
+      const mark = (r && r.mark) || (ev.side === 'short' ? pos.short.entry : pos.long.entry);
+      const expected = contrib(ev) * pos.base * mark;
+      if (ev.lastCheck && now - ev.lastCheck < 5000 && now < ev.ts + (this.cfg.fundingConfirmSec ?? 90) * 1000) continue;
+      ev.lastCheck = now;
+      let actual;
+      try {
+        actual = await this.ex[ev.ex].fetchFundingPaid(pos.symbol, ev.ts - 60000);
+      } catch (e) {
+        log.debug(`${ev.ex} fetchFundingHistory: ${e.message}`);
+      }
+      if (actual !== undefined && actual !== 0) {
+        Object.assign(ev, { paid: true, amount: actual, expected, confirmed: true });
+        pos.fundingAccrued += actual;
+        this.state.addDaily('funding', actual, ev.ts);
+        log.info(`${pos.symbol} ${ev.side}@${ev.ex}: фандінг підтверджено біржею ${sgn(actual)} (розрахунок ${sgn(expected)})`);
+        await this.checkFundingMatch(ev.ex, expected, actual, pos.symbol);
+        changed = true;
+      } else if (now >= ev.ts + (this.cfg.fundingConfirmSec ?? 90) * 1000) {
+        Object.assign(ev, { paid: true, amount: expected, expected, confirmed: false });
+        pos.fundingAccrued += expected;
+        this.state.addDaily('funding', expected, ev.ts);
+        log.warn(`${pos.symbol} ${ev.ex}: біржа не показала нарахування за ${this.cfg.fundingConfirmSec ?? 90} с — беру розрахунок ${sgn(expected)}`);
+        changed = true;
+      }
+    }
+    if (changed) this.state.save();
+  }
+
+  /** Розрахунок vs факт по біржі. 2 розбіжності з останніх 5 — біржу блокуємо до ручної перевірки (/unblock). */
+  async checkFundingMatch(exId, expected, actual, symbol) {
+    if (Math.abs(expected) < 0.01) return;
+    const ratio = actual / expected;
+    const bad = ratio < 0.5 || ratio > 1.5;
+    const fc = (this.state.data.fundingCheck = this.state.data.fundingCheck || {});
+    const list = (fc[exId] = (fc[exId] || []).concat({ ts: this.now(), symbol, expected, actual, bad }).slice(-5));
+    this.state.save();
+    if (!bad) return;
+    await this.notify(`⚠️ ${exId} ${symbol.split('/')[0]}: фандінг ${sgn(actual)} замість розрахованих ${sgn(expected)} (×${ratio.toFixed(2)})`);
+    const ex = this.ex[exId];
+    if (list.filter((x) => x.bad).length >= 2 && ex && !ex.tradeBlocked) {
+      ex.tradeBlocked = 'фактичний фандінг систематично не збігається з розрахунком — перевірте біржу, потім /unblock';
+      await this.notify(`⛔ ${exId}: торгівлю заблоковано — ${ex.tradeBlocked}`);
+    }
+  }
+
   /** Поточна різниця цін для закриття: купуємо назад шорт (ask S), продаємо лонг (bid L). */
   async exitQuote(pos) {
     const S = this.ex[pos.shortEx];
@@ -703,7 +768,8 @@ class Trader {
             continue;
           }
         }
-        this.processEvents(pos, ratesByExchange);
+        if (this.paper) this.processEvents(pos, ratesByExchange);
+        else await this.confirmEvents(pos, ratesByExchange);
         const pending = (pos.events || []).filter((e) => !e.paid);
         const mark = ratesByExchange[pos.longEx]?.[pos.symbol]?.mark || pos.long.entry;
 
@@ -736,8 +802,13 @@ class Trader {
               );
             }
           }
+        } else if (!pending.some((e) => e.ts > now)) {
+          // Час усіх виплат минув, але біржа ще не підтвердила нарахування — чекаємо (захист від ліквідації працює)
+          continue;
         } else {
-          const remaining = pending.reduce((a, e) => a + contrib(e), 0) * pos.base * mark;
+          // Рахуємо лише виплати, які ще попереду: минулі вже відбулись, вихід їх не скасує
+          const future = pending.filter((e) => e.ts > now);
+          const remaining = future.reduce((a, e) => a + contrib(e), 0) * pos.base * mark;
           // Ставка розвернулась і решта виплат принесе мінус — виходимо, не чекаючи
           if (remaining < 0) {
             await this.closePair(pos, `ставка змінилась, очікуваний фандінг став ${sgn(remaining)} ${this.cfg.quote}`);
@@ -840,6 +911,7 @@ class Trader {
         feeL = pos.base * exitL * L.takerFee(pos.symbol);
         typeS = typeL = opt.urgent || this.cfg.orderType === 'market' ? 'market' : 'limit';
       } else {
+        if (!quote && !opt.missing) quote = await this.exitQuote(pos).catch(() => undefined); // для статистики проковзування
         // Нога, якої вже немає на біржі (стоп/ліквідація/вручну), не закривається.
         // Ціна її закриття: факт з історії угод біржі → поточна ціна стакану → ціна стопу.
         for (const legKey of opt.missing || []) {
@@ -921,7 +993,17 @@ class Trader {
     const closeFees = feeS + feeL;
     const pricePnl = (pos.short.entry - exitS) * pos.base + (exitL - pos.long.entry) * pos.base;
     const pnl = pricePnl + pos.fundingAccrued - pos.feesPaid - closeFees;
-    const closed = this.state.closePosition(pos.id, { exitShort: exitS, exitLong: exitL, pricePnl, closeFees, pnl, reason });
+    // Проковзування: наскільки фактичні ціни гірші за очікувані (додатне — гірше), %
+    const slip = (exp, act, side) => (exp > 0 && act > 0 ? (side === 'sell' ? (exp - act) / exp : (act - exp) / exp) : undefined);
+    const ee = pos.expectedEntry || {};
+    const slipEntry = [slip(ee.short, pos.short.entry, 'sell'), slip(ee.long, pos.long.entry, 'buy')].filter(Number.isFinite);
+    const slipExit = quote ? [slip(quote.askS, exitS, 'buy'), slip(quote.bidL, exitL, 'sell')].filter(Number.isFinite) : [];
+    const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : undefined);
+    const closed = this.state.closePosition(pos.id, {
+      exitShort: exitS, exitLong: exitL, pricePnl, closeFees, pnl, reason,
+      slipEntry: avg(slipEntry), slipExit: avg(slipExit),
+      unconfirmedFunding: (pos.events || []).some((e) => e.paid && e.confirmed === false),
+    });
     const s = this.state.data.stats;
     const cS = pos.short.closedContracts || pos.short.contracts;
     const cL = pos.long.closedContracts || pos.long.contracts;
@@ -940,7 +1022,19 @@ class Trader {
         `Загальний PnL: ${sgn(s.realizedPnl)} ${this.cfg.quote} (${s.trades} угод)`
     );
     if (this.guard) await this.guard.onTradeClosed(pnl);
+    await this.maybeAutoBan(pos.symbol);
     return closed;
+  }
+
+  /** Монета дала autoBanLosses збиткових угод поспіль — у чорний список (зняти: /coinreset). */
+  async maybeAutoBan(symbol) {
+    const n = this.cfg.autoBanLosses || 0;
+    if (!(n > 0) || !this.coins) return;
+    const coin = coinOf(symbol);
+    const last = this.state.data.closed.filter((c) => c.symbol === symbol).slice(-n);
+    if (last.length < n || !last.every((c) => c.pnl < 0) || this.coins.isBanned(coin, '*')) return;
+    this.coins.ban(coin, '*');
+    await this.notify(`🚫 ${coin}: ${n} збиткових угод поспіль — монету автоматично додано в чорний список. Повернути: /coinreset ${coin}`);
   }
 }
 

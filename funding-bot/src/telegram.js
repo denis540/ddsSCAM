@@ -34,6 +34,13 @@ const COMMANDS = [
   ['Захист коштів', [
     ['safety', 'Стан захисту: стопи, ліміти, запобіжники'],
     ['reconcile', 'Звірити позиції бота з біржами зараз'],
+    ['selftest', 'Самоперевірка бірж (/selftest full — з мінімальною угодою)'],
+    ['unblock', 'Зняти блокування біржі: /unblock okx'],
+  ]],
+  ['Аналітика', [
+    ['stats', 'Статистика по біржах і монетах, проковзування'],
+    ['backtest', 'Перевірка стратегії на історії: /backtest 7'],
+    ['export', 'Угоди у файл CSV: /export 30'],
   ]],
   ['Налаштування і керування', [
     ['settings', 'Усі налаштування (змінювати кнопками)'],
@@ -89,18 +96,76 @@ const MAIN_MENU = inline([
   [btn('🏦 Біржі і ключі', 'c:/exchanges'), btn('🪙 Монети', 'c:/coins')],
   [btn('⚙️ Налаштування', 'c:/settings'), btn('🔢 Кількість монет', 'c:/qty')],
   [btn('🛡 Захист', 'c:/safety'), btn('🔄 Звірка з біржами', 'c:/reconcile')],
+  [btn('🧪 Самоперевірка', 'c:/selftest'), btn('📊 Статистика', 'c:/stats')],
+  [btn('📈 Історія ставок', 'c:/backtest'), btn('📄 Експорт CSV', 'c:/export')],
   [btn('⏸ Пауза', 'c:/pause'), btn('▶️ Старт', 'c:/resume')],
   [btn('🛑 Закрити позицію', 'closemenu'), btn('❓ Усі команди', 'c:/help')],
 ]);
 
 class Telegram {
-  constructor({ token, chatIds }) {
+  constructor({ token, chatIds, pin } = {}) {
     this.token = token;
     this.chatIds = (chatIds || []).map(String);
     this.enabled = Boolean(token && this.chatIds.length);
     this.offset = 0;
     this.stopped = false;
     this.awaiting = {}; // chatId -> { type, key?, ex? } — бот чекає на текст від користувача
+    this.pin = String(pin || '');
+    this.unlockedUntil = {}; // chatId -> ts: після правильного PIN 10 хв без повторного запиту
+    this.pinFails = 0;
+    this.pinLockedUntil = 0;
+  }
+
+  isUnlocked(chatId) {
+    return !this.pin || (this.unlockedUntil[chatId] || 0) > Date.now();
+  }
+
+  /** Небезпечна дія: просимо PIN, після правильного — виконуємо відкладену дію. */
+  async askPin(chatId, action) {
+    if (Date.now() < this.pinLockedUntil) {
+      return this.send(`🔒 Забагато невірних PIN. Спробуйте після ${new Date(this.pinLockedUntil).toISOString().slice(11, 16)} UTC.`, chatId);
+    }
+    this.awaiting[chatId] = { type: 'pin', action };
+    return this.send('🔐 Ця дія потребує PIN. Надішліть PIN (повідомлення буде видалено).', chatId, inline([[btn('Скасувати', 'cancel')]]));
+  }
+
+  async checkPin(text, chatId, messageId, action) {
+    if (messageId) this.api('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    const a = Buffer.from(String(text).trim());
+    const b = Buffer.from(this.pin);
+    const ok = a.length === b.length && require('crypto').timingSafeEqual(a, b);
+    if (!ok) {
+      this.pinFails += 1;
+      if (this.pinFails >= 5) {
+        this.pinFails = 0;
+        this.pinLockedUntil = Date.now() + 15 * 60000;
+        log.warn('Telegram: 5 невірних PIN — блокування на 15 хв');
+        return this.send('🚨 5 невірних PIN поспіль. Небезпечні дії заблоковано на 15 хв.', chatId);
+      }
+      return this.send(`❌ Невірний PIN (спроба ${this.pinFails}/5)`, chatId);
+    }
+    this.pinFails = 0;
+    this.unlockedUntil[chatId] = Date.now() + 10 * 60000;
+    await this.send('🔓 PIN прийнято (10 хв без повторного запиту)', chatId);
+    return action();
+  }
+
+  async sendDocument(chatId, filename, content, caption) {
+    log.info(`[tg] документ ${filename}`);
+    if (!this.enabled) return;
+    for (const id of chatId ? [String(chatId)] : this.chatIds) {
+      try {
+        const fd = new FormData();
+        fd.append('chat_id', id);
+        fd.append('document', new Blob([content], { type: 'text/csv' }), filename);
+        if (caption) fd.append('caption', caption);
+        const res = await fetch(`https://api.telegram.org/bot${this.token}/sendDocument`, { method: 'POST', body: fd });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.description);
+      } catch (e) {
+        log.warn(`Telegram sendDocument: ${e.message}`);
+      }
+    }
   }
 
   async api(method, body) {
@@ -295,6 +360,8 @@ class Telegram {
   async handleCallback(data, chatId) {
     const [kind, a, b] = String(data).split(':');
     const { settings, state, trader } = this.ctx;
+    const DANGER = ['sv', 'closey', 'closeally', 'orph', 'qtydel', 'coinok', 'coinreset', 'delkey', 'selftestfull'];
+    if (DANGER.includes(kind) && !this.isUnlocked(chatId)) return this.askPin(chatId, () => this.handleCallback(data, chatId));
     if (kind !== 'set') delete this.awaiting[chatId];
     switch (kind) {
       case 'm':
@@ -356,6 +423,8 @@ class Telegram {
         return this.send(`Закрити всі ${state.positions.length} пар?`, chatId, inline([[btn('✅ Так, закрити всі', 'closeally'), btn('Ні', 'm')]]));
       case 'closeally':
         return this.handle('/closeall yes', chatId);
+      case 'selftestfull':
+        return this.handle('/selftest full yes', chatId);
       case 'orph': {
         const r = await this.ctx.reconciler.closeOrphan(a);
         return this.send(r, chatId, MAIN_MENU);
@@ -368,6 +437,11 @@ class Telegram {
   /** Користувач надіслав значення у відповідь на запит бота. */
   async handleInput(wait, text, chatId, messageId) {
     delete this.awaiting[chatId];
+    if (wait.type === 'pin') return this.checkPin(text, chatId, messageId, wait.action);
+    if (wait.type === 'setkey' && messageId) this.api('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    if (['set', 'setkey', 'qty'].includes(wait.type) && !this.isUnlocked(chatId)) {
+      return this.askPin(chatId, () => this.handleInput(wait, text, chatId));
+    }
     switch (wait.type) {
       case 'set': {
         const v = this.ctx.settings.set(wait.key, text.replace(/\s+/g, ','));
@@ -495,6 +569,15 @@ class Telegram {
     const line = BUTTONS[text] || text;
     const [rawCmd, ...args] = line.split(/\s+/);
     const cmd = rawCmd.toLowerCase().replace(/@.*$/, '');
+
+    // Небезпечні дії — лише після PIN (якщо TELEGRAM_PIN задано)
+    const DANGER = ['/set', '/setkey', '/delkey', '/close', '/closeall', '/resume', '/coinok', '/coinreset', '/unblock'];
+    const isDanger = (DANGER.includes(cmd) && !(cmd === '/close' && !args[0]) && !(cmd === '/closeall' && args[0] !== 'yes') && !(['/set', '/qty'].includes(cmd) && args.length < 2)) ||
+      (cmd === '/qty' && args.length >= 2) || (cmd === '/selftest' && args[0] === 'full' && args[1] === 'yes');
+    if (isDanger && !this.isUnlocked(chatId)) {
+      if (cmd === '/setkey' && messageId) this.api('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return this.askPin(chatId, () => this.handle(text, chatId));
+    }
 
     switch (cmd) {
       case '/start':
@@ -647,6 +730,64 @@ class Telegram {
         if (!args[0]) return reply('Формат: /coinreset <монета>');
         this.ctx.coins.reset(args[0].toUpperCase());
         return reply(`↩️ ${args[0].toUpperCase()}: ручні рішення скинуто, діють автоматичні перевірки`);
+      }
+      case '/selftest': {
+        const full = args[0] === 'full';
+        if (full && args[1] !== 'yes') {
+          return reply(
+            '🧪 Повна самоперевірка відкриє на КОЖНІЙ біржі з ключем мінімальну позицію (BTC або перша монета), поставить і зніме стоп, і одразу закриє позицію.\n' +
+              'Коштує дві мінімальні комісії на біржу. Продовжити?',
+            inline([[btn('✅ Так, повна перевірка', 'selftestfull'), btn('Ні', 'm')]])
+          );
+        }
+        const exs = Object.values(this.ctx.exchanges).filter((e) => e.hasKeys);
+        if (!exs.length) return reply('Немає бірж з API-ключами.', inline([[btn('🏦 Додати ключі', 'c:/exchanges')]]));
+        await reply(`🧪 Самоперевірка${full ? ' (повна)' : ''}: ${exs.map((e) => e.id).join(', ')}…`);
+        const out = await trader.withLock(() => Promise.all(exs.map(async (ex) => [ex, await ex.runSelfTest({ full })])));
+        const lines = out.map(([ex, r]) => {
+          if (this.ctx.applySelfTest) this.ctx.applySelfTest(ex, r);
+          return `${r.ok ? '✅' : '⛔'} ${ex.title}\n${r.checks.map((c) => `   ${c.ok ? '✓' : c.critical === false ? '⚠' : '✗'} ${c.name}: ${c.info}`).join('\n')}`;
+        });
+        return reply(
+          `${lines.join('\n\n')}\n\n✓ ok  ⚠ не критично (бот обійде)  ✗ критично — на цій біржі бот не торгує` +
+            (full ? '' : '\n\nСтоп-ордери перевіряються лише в повній перевірці: /selftest full'),
+          full ? undefined : inline([[btn('🧪 Повна перевірка (мін. угода)', 'c:/selftest full')], [btn('🏠 Меню', 'm')]])
+        );
+      }
+      case '/unblock': {
+        const id = normalizeName(args[0]);
+        const ex = this.ctx.all[id];
+        if (!ex) return reply(`Формат: /unblock <біржа>. Заблоковані: ${Object.values(this.ctx.all).filter((e) => e.tradeBlocked).map((e) => e.id).join(', ') || 'немає'}`);
+        const was = ex.tradeBlocked;
+        ex.tradeBlocked = undefined;
+        if (state.data.fundingCheck) delete state.data.fundingCheck[id];
+        state.save();
+        return reply(`✅ ${ex.title}: блокування знято${was ? ` (було: ${was})` : ''}. Режим позицій і самоперевірка повторяться при наступному старті.`);
+      }
+      case '/stats':
+        return reply(R.formatStats(state, cfg));
+      case '/export': {
+        const days = Number(args[0]) || 30;
+        const csv = R.tradesCsv(state, days);
+        const n = csv.trim().split('\n').length - 1;
+        if (n <= 0) return reply(`За ${days} дн закритих угод немає`);
+        await this.sendDocument(chatId, `trades_${state.dayKey()}_${days}d.csv`, csv, `Угоди за ${days} дн: ${n}`);
+        return undefined;
+      }
+      case '/backtest': {
+        const days = Math.min(Number(args[0]) || 7, 60);
+        if (!this.ctx.runBacktest) return reply('Недоступно');
+        if (this.backtestRunning) return reply('Перевірка вже виконується…');
+        this.backtestRunning = true;
+        await reply(`📈 Перевірка на історії за ${days} дн запущена — це займе кілька хвилин. Торгівля не зупиняється.`);
+        this.ctx
+          .runBacktest(days)
+          .then((r) => this.send(r.text, chatId))
+          .catch((e) => this.send(`❌ Перевірка на історії: ${e.message}`, chatId))
+          .finally(() => {
+            this.backtestRunning = false;
+          });
+        return undefined;
       }
       case '/pause':
         settings.setPaused(true);

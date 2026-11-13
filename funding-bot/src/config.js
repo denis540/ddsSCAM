@@ -102,6 +102,12 @@ const config = {
   maxClockSkewMs: num('MAX_CLOCK_SKEW_MS', 1500), // попередження, якщо годинник сервера розходиться з біржами
   heartbeatHours: num('HEARTBEAT_HOURS', 3), // повідомлення «я працюю» в Telegram (0 = вимк.)
   sandbox: bool('SANDBOX', false), // тестові мережі бірж (Binance, Bybit, OKX, BingX, Kraken)
+  fundingConfirmSec: num('FUNDING_CONFIRM_SEC', 90), // live: чекати, поки біржа покаже нарахування фандінгу, до N с
+  autoBanLosses: num('AUTOBAN_LOSSES', 3), // монета дала N збиткових угод поспіль — у чорний список (0 = вимк.)
+  imbalanceRatio: num('IMBALANCE_RATIO', 2), // попередити, якщо баланс на одній біржі в N разів більший, ніж на іншій (0 = вимк.)
+  selfTestOnStart: bool('SELFTEST_ON_START', true), // live: самоперевірка кожної біржі з ключем при старті; не пройшла — не торгуємо
+  lockFile: process.env.LOCK_FILE || 'data/bot.lock',
+  keysSecret: process.env.KEYS_SECRET || '', // пароль шифрування data/keys.json (AES-256-GCM)
 
   // Перевірка, що монети з однаковою назвою — одна й та сама монета
   coinPriceTol: num('COIN_PRICE_TOL_PCT', 3) / 100, // різниця цін більша — вважаємо різними монетами
@@ -129,6 +135,7 @@ const config = {
     token: process.env.TELEGRAM_BOT_TOKEN,
     // Хто може керувати ботом і куди йдуть повідомлення (через кому, можна кілька)
     chatIds: list('TELEGRAM_CHAT_ID'),
+    pin: process.env.TELEGRAM_PIN || '', // PIN для небезпечних дій (ключі, налаштування, закриття, /resume)
   },
 };
 

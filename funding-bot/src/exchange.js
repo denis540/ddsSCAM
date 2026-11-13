@@ -103,6 +103,9 @@ class Exchange {
     this.iocUnsupported = false; // біржа відхилила лімітний IOC — далі лише ринкові
     this.tradeBlocked = undefined; // причина, чому на біржі не можна торгувати (напр. hedge mode)
     this.tickers = {}; // канонічний символ -> { volumeUsdt }
+    this.accountFees = {}; // канонічний символ -> { taker, at } — фактичні комісії вашого акаунта
+    this.maintenance = undefined; // опис техробіт на біржі, якщо є
+    this.selfTest = undefined; // результат останньої самоперевірки
   }
 
   /** Тестова мережа біржі (SANDBOX=true). @returns {boolean} чи підтримується */
@@ -202,9 +205,50 @@ class Exchange {
     return this.market(symbol).settle || this.quote;
   }
 
+  /** Тейкер-комісія: фактична вашого акаунта (якщо вже завантажена), інакше — базова з даних ринку. */
   takerFee(symbol) {
+    const a = this.accountFees[symbol];
+    if (a && Number.isFinite(a.taker)) return a.taker;
     const m = this.client.markets[this.n(symbol)];
     return m && Number.isFinite(m.taker) ? m.taker : this.defaultTakerFee;
+  }
+
+  /** Усі комісії акаунта одним запитом (де біржа дозволяє). Потрібен API-ключ. */
+  async loadAccountFees() {
+    if (!this.hasKeys || !this.client.has.fetchTradingFees) return 0;
+    const fees = await this.client.fetchTradingFees();
+    let n = 0;
+    for (const [sym, f] of Object.entries(fees || {})) {
+      const c = this.fromNative[f.symbol || sym];
+      if (c && Number.isFinite(f.taker)) {
+        this.accountFees[c] = { taker: f.taker, at: Date.now() };
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  /** Фактична комісія для монети перед входом (кеш на добу). */
+  async ensureFee(symbol) {
+    if (!this.hasKeys || !this.client.has.fetchTradingFee) return this.takerFee(symbol);
+    const a = this.accountFees[symbol];
+    if (a && Date.now() - a.at < 86400000) return a.taker;
+    try {
+      const f = await this.client.fetchTradingFee(this.n(symbol));
+      if (f && Number.isFinite(f.taker)) this.accountFees[symbol] = { taker: f.taker, at: Date.now() };
+    } catch (e) {
+      log.debug(`${this.id} fetchTradingFee ${symbol}: ${e.message}`);
+    }
+    return this.takerFee(symbol);
+  }
+
+  /** Технічні роботи на біржі (fetchStatus). */
+  async checkStatus() {
+    if (!this.client.has.fetchStatus) return undefined;
+    const st = await this.client.fetchStatus();
+    const status = String((st && st.status) || '').toLowerCase();
+    this.maintenance = status && status !== 'ok' ? `статус біржі «${status}»${st.eta ? `, до ${new Date(st.eta).toISOString().slice(11, 16)} UTC` : ''}` : undefined;
+    return this.maintenance;
   }
 
   /** @returns {Promise<Object<string,{rate:number,intervalH:number,nextTs:number|undefined,mark:number|undefined}>>} */
@@ -532,6 +576,117 @@ class Exchange {
     const qty = t.reduce((a, x) => a + (x.amount || 0), 0);
     if (!(qty > 0)) return undefined;
     return t.reduce((a, x) => a + x.price * (x.amount || 0), 0) / qty / (this.mult[symbol] || 1);
+  }
+
+  /** Історія ставок фандінгу (для перевірки стратегії на історії). */
+  async fundingRateHistory(symbol, since, until = Date.now()) {
+    if (!this.client.has.fetchFundingRateHistory) return [];
+    const s = this.n(symbol);
+    const out = [];
+    let from = since;
+    for (let page = 0; page < 30 && from < until; page++) {
+      const rows = await this.client.fetchFundingRateHistory(s, from, 100);
+      if (!rows || !rows.length) break;
+      for (const r of rows) if (r.timestamp >= since && r.timestamp <= until && Number.isFinite(r.fundingRate)) out.push({ ts: r.timestamp, rate: r.fundingRate });
+      const last = rows[rows.length - 1].timestamp;
+      if (!(last > from)) break;
+      from = last + 1;
+      if (rows.length < 100) break;
+    }
+    const seen = new Set();
+    return out.filter((r) => (seen.has(r.ts) ? false : seen.add(r.ts))).sort((a, b) => a.ts - b.ts);
+  }
+
+  /**
+   * Самоперевірка біржі перед торгівлею (без ризику): баланс, режим позицій, лімітний IOC,
+   * що гарантовано не виконається (ціна на 3% гірша за ринок), читання історій.
+   * full=true — додатково відкриває мінімальну позицію, ставить і знімає стоп, закриває позицію
+   * (коштує лише дві мінімальні комісії).
+   * @returns {Promise<{ok:boolean, checks:Array<{name:string, ok:boolean, info:string}>}>}
+   */
+  async runSelfTest({ full = false, symbol } = {}) {
+    const checks = [];
+    const step = async (name, fn, critical = true) => {
+      try {
+        const info = await fn();
+        checks.push({ name, ok: true, info: info || '' });
+        return true;
+      } catch (e) {
+        checks.push({ name, ok: false, critical, info: e.message.slice(0, 160) });
+        return false;
+      }
+    };
+    if (!this.hasKeys) return { ok: false, checks: [{ name: 'API-ключ', ok: false, critical: true, info: 'немає ключа' }] };
+    const sym = symbol || (this.native['BTC/USDT:USDT'] ? 'BTC/USDT:USDT' : this.perpSymbols()[0]);
+    await step('баланс', async () => {
+      const b = await this.balanceSummary();
+      if (!(b.free > 0)) throw new Error(`вільний баланс ${b.free} ${b.currency}`);
+      return `${b.free.toFixed(2)} ${b.currency}`;
+    });
+    await step('режим позицій one-way', async () => {
+      const r = await this.ensureOneWay();
+      if (r) throw new Error(r);
+      return 'ok';
+    });
+    await step('стакан і ціна', async () => {
+      const ob = await this.fetchOrderBook(sym);
+      if (!ob.bids[0] || !ob.asks[0]) throw new Error('порожній стакан');
+      return `${sym.split('/')[0]} ${ob.bids[0][0]}`;
+    });
+    await step('лімітний IOC (без виконання)', async () => {
+      const ob = await this.fetchOrderBook(sym);
+      const price = ob.bids[0][0] * 0.97; // нижче ринку — купівля не виконається
+      const minB = Math.max(this.minBaseAmount(sym, price), this.amountStep(sym) || 0);
+      const c = Math.max(this.baseToContracts(sym, minB * 1.05), ((this.market(sym).limits || {}).amount || {}).min || 0);
+      const o = await this.limitIOC(sym, 'buy', c, price, {});
+      if (o.filled > 0) throw new Error(`несподівано виконався на ${o.filled} — закрийте вручну!`);
+      return 'біржа приймає IOC';
+    }, false);
+    await step('історія фандінгу', async () => {
+      await this.client.fetchFundingHistory(this.n(sym), Date.now() - 86400000);
+      return 'читається';
+    }, false);
+    await step('історія угод', async () => {
+      if (!this.client.has.fetchMyTrades) throw new Error('не підтримується');
+      await this.client.fetchMyTrades(this.n(sym), Date.now() - 86400000);
+      return 'читається';
+    }, false);
+    await step('комісії акаунта', async () => `тейкер ${((await this.ensureFee(sym)) * 100).toFixed(4)}%`, false);
+    if (full) {
+      // Мінімальна реальна позиція: відкрити → стоп → зняти стоп → закрити
+      let opened = 0;
+      await step('відкриття мінімальної позиції', async () => {
+        const ob = await this.fetchOrderBook(sym);
+        const price = ob.asks[0][0];
+        const minB = Math.max(this.minBaseAmount(sym, price), this.amountStep(sym) || 0);
+        const c = Math.max(this.baseToContracts(sym, minB * 1.05), ((this.market(sym).limits || {}).amount || {}).min || 0);
+        const o = await this.marketOrder(sym, 'buy', c);
+        opened = o.filled;
+        return `${this.contractsToBase(sym, opened)} ${sym.split('/')[0]} @ ${o.average}`;
+      });
+      if (opened > 0) {
+        await step('стоп-ордер на біржі', async () => {
+          const ob = await this.fetchOrderBook(sym);
+          const st = await this.placeStop(sym, 'sell', opened, ob.bids[0][0] * 0.8);
+          await this.cancelStop(sym, st.id);
+          return 'ставиться і знімається';
+        });
+        await step('позиція видна на біржі', async () => {
+          const p = await this.fetchPosition(sym);
+          if (!p) throw new Error('fetchPositions не показує позицію');
+          return `${p.contracts} контр., ліквідація ${p.liquidationPrice || '—'}`;
+        });
+        await step('закриття позиції', async () => {
+          await this.marketOrder(sym, 'sell', opened, { reduceOnly: true });
+          const p = await this.fetchPosition(sym);
+          if (p) throw new Error('позиція лишилась — закрийте вручну!');
+          return 'закрито';
+        });
+      }
+    }
+    const ok = checks.every((c) => c.ok || !c.critical);
+    this.selfTest = { ok, checks, at: Date.now(), full };
+    return this.selfTest;
   }
 
   async fetchPosition(symbol) {

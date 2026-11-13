@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node src/index.js",
     "scan": "node src/index.js --scan-only",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "backtest": "node scripts/backtest.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
   "dependencies": {
     "ccxt": "^4.5.92",

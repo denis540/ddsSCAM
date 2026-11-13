@@ -46,7 +46,13 @@ function fakeClient(opts = {}) {
       this.orders.push({ s, type, side, amount, params });
       // fillRatio < 1 — біржа виконує ордер частково (лише перший ордер, якщо partialOnce)
       let filled = amount;
-      if (type === 'limit' && this.limitFill !== undefined) filled = Math.floor((amount * this.limitFill) / step + 1e-9) * step;
+      if (type === 'limit') {
+        // як на біржі: лімітка виконується лише якщо ціна не гірша за найкращу в стакані
+        const ob = await this.fetchOrderBook();
+        const marketable = side === 'buy' ? _p >= ob.asks[0][0] - 1e-12 : _p <= ob.bids[0][0] + 1e-12;
+        if (!marketable) filled = 0;
+        if (this.limitFill !== undefined) filled = Math.floor((amount * this.limitFill) / step + 1e-9) * step;
+      }
       if (this.fillRatio && (!this.partialOnce || !this.partialDone)) {
         filled = Math.floor((amount * this.fillRatio) / step + 1e-9) * step;
         this.partialDone = true;

@@ -61,6 +61,8 @@ test('стопи на біржах ставляться після входу (8
   assert.ok(Math.abs(sa.params.stopLossPrice - (pos.short.entry + (133.33 - pos.short.entry) * 0.8)) < 1e-6, String(sa.params.stopLossPrice));
   assert.ok(sb.params.stopLossPrice < pos.long.entry && sb.params.stopLossPrice > 66.67);
   assert.match(msgs.join('\n'), /захисні стопи на біржах/);
+  a.client.funding = [{ symbol: SYM, timestamp: Date.now() + 100000, amount: 0.75 }];
+  b.client.funding = [{ symbol: SYM, timestamp: Date.now() + 100000, amount: -0.25 }];
   at(115000);
   await trader.manage(await rates());
   assert.equal(state.positions.length, 0);
@@ -345,4 +347,105 @@ test('SANDBOX: тестова мережа є у Binance/Bybit/OKX/BingX/Kraken,
   const no = ['htx', 'bitget', 'kucoin'].map((id) => new Exchange(id, {}).enableSandbox());
   assert.deepEqual(yes, [true, true, true, true, true]);
   assert.deepEqual(no, [false, false, false]);
+});
+
+// ---------- Підтвердження нарахування фандінгу ----------
+
+test('live: не виходимо, доки біржа не покаже нарахування фандінгу (або не мине fundingConfirmSec)', async () => {
+  const { a, b, state, trader, rates, window, at } = await setup({ fundingConfirmSec: 90 });
+  assert.ok(await trader.tryOpen(await window()));
+  at(115000); // виплата була 15 с тому, ціни зійшлися, але нарахування ще не видно
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'чекаємо підтвердження');
+  a.client.funding = [{ symbol: SYM, timestamp: Date.now() + 100000, amount: 0.75 }];
+  at(125000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'на b ще не підтверджено');
+  at(100000 + 91000); // минуло 90 с — беремо розрахунок
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  const c = state.data.closed[0];
+  assert.ok(c.unconfirmedFunding);
+  const ev = c.events.find((e) => e.ex === 'a');
+  assert.equal(ev.confirmed, true);
+  assert.equal(ev.amount, 0.75);
+  assert.ok(b);
+});
+
+test('фандінг систематично не збігається з розрахунком — біржу блокуємо, /unblock знімає', async () => {
+  const { a, trader, msgs } = await setup();
+  await trader.checkFundingMatch('a', 1, 0.98, SYM);
+  assert.ok(!a.tradeBlocked);
+  await trader.checkFundingMatch('a', 1, -1, SYM); // інший знак
+  assert.ok(!a.tradeBlocked, 'одна розбіжність — лише попередження');
+  assert.match(msgs.at(-1), /замість розрахованих/);
+  await trader.checkFundingMatch('a', 1, 10, SYM); // у 10 разів більше (масштаб ставки?)
+  assert.match(a.tradeBlocked, /не збігається/);
+  assert.match(msgs.at(-1), /заблоковано/);
+});
+
+// ---------- Фактичні комісії ----------
+
+test('фактичні комісії акаунта замість базових', async () => {
+  const { a, trader, window, cfg } = await setup();
+  a.client.has.fetchTradingFee = true;
+  a.client.fetchTradingFee = async () => ({ taker: 0.0002 });
+  assert.equal(a.takerFee(SYM), 0.0005);
+  assert.ok(await trader.tryOpen(await window()));
+  assert.equal(a.takerFee(SYM), 0.0002);
+  assert.ok(cfg);
+});
+
+// ---------- Техроботи ----------
+
+test('техроботи на біржі — не входимо', async () => {
+  const { a, trader, window } = await setup();
+  a.client.has.fetchStatus = true;
+  a.client.fetchStatus = async () => ({ status: 'maintenance' });
+  await a.checkStatus();
+  assert.match(a.maintenance, /maintenance/);
+  assert.equal(await trader.tryOpen(await window()), false);
+  a.client.fetchStatus = async () => ({ status: 'ok' });
+  await a.checkStatus();
+  assert.equal(a.maintenance, undefined);
+});
+
+// ---------- Самоперевірка ----------
+
+test('самоперевірка: безпечна і повна; критична помилка блокує біржу', async () => {
+  const { a } = await setup();
+  a.client.markets[SYM].limits.amount.min = 0.001;
+  let r = await a.runSelfTest();
+  assert.ok(r.ok, JSON.stringify(r.checks));
+  assert.ok(r.checks.find((c) => c.name.startsWith('лімітний IOC')).ok);
+  assert.equal(a.client.orders.at(-1).type, 'limit');
+  assert.equal(a.client.pos[SYM] || 0, 0, 'IOC не виконався — позиції немає');
+  a.client.limitFill = 0;
+  r = await a.runSelfTest({ full: true });
+  assert.ok(r.ok, JSON.stringify(r.checks));
+  assert.ok(r.checks.find((c) => c.name === 'стоп-ордер на біржі').ok);
+  assert.equal(a.client.stops.at(-1).active, false, 'тестовий стоп знято');
+  assert.equal(a.client.pos[SYM], 0, 'тестову позицію закрито');
+  a.client.stopFail = true;
+  r = await a.runSelfTest({ full: true });
+  assert.equal(r.ok, false);
+  a.client.fetchBalance = async () => ({ free: { USDT: 0 }, total: { USDT: 0 } });
+  r = await a.runSelfTest();
+  assert.equal(r.ok, false);
+  assert.match(r.checks[0].info, /вільний баланс 0/);
+});
+
+// ---------- Автобан монети ----------
+
+test('3 збиткові угоди поспіль по монеті — монета в чорному списку', async () => {
+  const { CoinRegistry } = require('../src/coins');
+  const { trader, state, msgs } = await setup({ autoBanLosses: 3 });
+  trader.coins = new CoinRegistry({ coinPriceTol: 0.03 }, null);
+  for (const pnl of [-1, -2]) state.data.closed.push({ symbol: SYM, pnl });
+  await trader.maybeAutoBan(SYM);
+  assert.ok(!trader.coins.isBanned('ETH', 'a'));
+  state.data.closed.push({ symbol: SYM, pnl: -0.5 });
+  await trader.maybeAutoBan(SYM);
+  assert.ok(trader.coins.isBanned('ETH', 'a'));
+  assert.match(msgs.at(-1), /автоматично додано в чорний список/);
 });
