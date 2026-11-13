@@ -28,6 +28,7 @@ const SCHEMA = {
   basis: { label: 'Макс. різниця цін на вході', field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами на вході, %' },
   slippage: { label: 'Макс. слипедж', field: 'maxSlippagePct', type: 'pct', min: 0, desc: 'Макс. слипедж по стакану, %' },
   liqbuffer: { label: 'Запас до ліквідації', field: 'liqBufferPct', type: 'pct', min: 1, max: 90, desc: 'Закрити, якщо до ліквідації менше, %' },
+  liqcheck: { label: 'Перевірка ліквідації, с', field: 'liqCheckSec', type: 'int', min: 5, max: 300, desc: 'Як часто перевіряти, чи не наближається якась нога до ліквідації (обидві біржі одночасно)' },
   maxrate: { label: 'Макс. ставка (аномалії)', field: 'maxAbsFundingRate', type: 'pct', min: 0, desc: 'Ігнорувати ставки фандінгу більші за, % (аномалії)' },
   interval: { label: 'Оновлення ставок, с', field: 'scanIntervalSec', type: 'int', min: 10, desc: 'Інтервал оновлення ставок, сек' },
   pricetol: { label: 'Допуск ціни монет', field: 'coinPriceTol', type: 'pct', min: 0.1, max: 50, desc: 'Якщо ціни монети на біржах відрізняються більше — це різні монети, %' },

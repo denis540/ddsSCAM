@@ -208,3 +208,26 @@ test('live: біржа без API-ключа — не торгуємо (лише
   assert.equal(state.positions.length, 0);
   assert.equal(b.client.orders.length, 0);
 });
+
+test('ризик ліквідації перевіряється кожні 5 с на обох біржах одночасно', async () => {
+  const { a, b, state, trader, rates, window, at, msgs } = await setup({ mode: 'live', leverage: 3, liqCheckSec: 5 });
+  assert.ok(await trader.tryOpen(await window()));
+  const sym = 'ETH/USDT:USDT';
+  const calls = [];
+  const pos = (ex, liq) => async () => { calls.push(ex); return [{ symbol: sym, contracts: 1, markPrice: 100, liquidationPrice: liq }]; };
+  a.client.fetchPositions = pos('a', 130);
+  b.client.fetchPositions = pos('b', 70);
+  a.client.price = 101; // щоб не спрацював вихід через сходження цін
+  at(10000);
+  await trader.manage(await rates());
+  at(15000);
+  await trader.manage(await rates());
+  assert.deepEqual(calls, ['a', 'b', 'a', 'b'], 'дві перевірки за 5 с, кожна — обидві біржі');
+  assert.equal(state.positions.length, 1);
+  // ціна наблизилась до ліквідації лонгу (до неї 10% < 15%)
+  b.client.fetchPositions = pos('b', 90);
+  at(20000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /long b: до ліквідації 10\.0%/);
+});

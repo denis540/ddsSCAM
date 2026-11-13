@@ -563,8 +563,9 @@ class Trader {
             }
           }
         }
-        // Ризик ліквідації — не частіше ніж раз на 30 с
-        if (!pos.lastRiskCheck || now - pos.lastRiskCheck > 30000) {
+        // Ризик ліквідації — кожні liqCheckSec (за замовчуванням 5 с, тобто кожен тік)
+        const every = (this.cfg.liqCheckSec ?? 5) * 1000;
+        if (!pos.lastRiskCheck || now - pos.lastRiskCheck >= every - 500) {
           pos.lastRiskCheck = now;
           const risk = await this.liquidationRisk(pos, ratesByExchange);
           if (risk) await this.closePair(pos, risk);
@@ -575,30 +576,56 @@ class Trader {
     }
   }
 
+  /**
+   * Чи не наближається якась нога до ліквідації. Обидві біржі перевіряються паралельно.
+   * Live — ціна ліквідації і mark з позиції на біржі; paper — оцінка за поточним стаканом і плечем.
+   */
   async liquidationRisk(pos, ratesByExchange) {
     const buf = this.cfg.liqBufferPct;
+    const legs = [[pos.shortEx, 'short'], [pos.longEx, 'long']];
     if (this.paper) {
-      // Груба модель ізольованої маржі: ліквідація при русі ~1/leverage
+      // Груба модель ізольованої маржі: ліквідація при русі ~1/leverage. Ціни — свіжі зі стакану.
       const lev = pos.leverage || this.cfg.leverage;
-      const markS = ratesByExchange[pos.shortEx]?.[pos.symbol]?.mark;
-      const markL = ratesByExchange[pos.longEx]?.[pos.symbol]?.mark;
-      if (markS && (pos.short.entry * (1 + 1 / lev) - markS) / markS < buf) return `SHORT ${pos.shortEx} близько до ліквідації`;
-      if (markL && (markL - pos.long.entry * (1 - 1 / lev)) / markL < buf) return `LONG ${pos.longEx} близько до ліквідації`;
+      const marks = await Promise.all(
+        legs.map(async ([exId]) => {
+          try {
+            const ob = await this.ex[exId].fetchOrderBook(pos.symbol);
+            const b = ob.bids[0] && ob.bids[0][0];
+            const a = ob.asks[0] && ob.asks[0][0];
+            if (b && a) return (a + b) / 2;
+          } catch (e) {
+            log.debug(`${exId} orderbook ${pos.symbol}: ${e.message}`);
+          }
+          return ratesByExchange[exId]?.[pos.symbol]?.mark;
+        })
+      );
+      const [markS, markL] = marks;
+      if (markS) {
+        const dist = (pos.short.entry * (1 + 1 / lev) - markS) / markS;
+        if (dist < buf) return `SHORT ${pos.shortEx}: до ліквідації ~${pct(Math.max(dist, 0), 1)}`;
+      }
+      if (markL) {
+        const dist = (markL - pos.long.entry * (1 - 1 / lev)) / markL;
+        if (dist < buf) return `LONG ${pos.longEx}: до ліквідації ~${pct(Math.max(dist, 0), 1)}`;
+      }
       return undefined;
     }
-    for (const [exId, side] of [[pos.shortEx, 'short'], [pos.longEx, 'long']]) {
-      try {
-        const p = await this.ex[exId].fetchPosition(pos.symbol);
-        if (!p) return `позиція ${side} на ${exId} зникла (ліквідація/ручне закриття?)`;
-        if (p.liquidationPrice && p.markPrice) {
-          const dist = Math.abs(p.markPrice - p.liquidationPrice) / p.markPrice;
-          if (dist < buf) return `${side} ${exId}: до ліквідації ${pct(dist, 1)}`;
+    const results = await Promise.all(
+      legs.map(async ([exId, side]) => {
+        try {
+          const p = await this.ex[exId].fetchPosition(pos.symbol);
+          if (!p) return `позиція ${side} на ${exId} зникла (ліквідація/ручне закриття?)`;
+          if (p.liquidationPrice && p.markPrice) {
+            const dist = Math.abs(p.markPrice - p.liquidationPrice) / p.markPrice;
+            if (dist < buf) return `${side} ${exId}: до ліквідації ${pct(dist, 1)}`;
+          }
+        } catch (e) {
+          log.warn(`${exId} fetchPosition ${pos.symbol}: ${e.message}`);
         }
-      } catch (e) {
-        log.warn(`${exId} fetchPosition ${pos.symbol}: ${e.message}`);
-      }
-    }
-    return undefined;
+        return undefined;
+      })
+    );
+    return results.find(Boolean);
   }
 
   /** Закриває пару тією ж кількістю монет, якою відкривали. */
