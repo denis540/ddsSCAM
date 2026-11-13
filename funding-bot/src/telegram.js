@@ -2,12 +2,15 @@
 
 const log = require('./logger');
 const R = require('./report');
+const { META, normalizeName, SUPPORTED } = require('./exchanges-meta');
+const { mask } = require('./keys');
 
 const KEYBOARD = {
   keyboard: [
     [{ text: '📊 Статус' }, { text: '📈 Позиції' }, { text: '🔝 Топ' }],
     [{ text: '💰 Звіт' }, { text: '📜 Історія' }, { text: '⚙️ Налаштування' }],
-    [{ text: '⏸ Пауза' }, { text: '▶️ Старт' }, { text: '❓ Допомога' }],
+    [{ text: '🏦 Біржі' }, { text: '💵 Баланс' }, { text: '❓ Допомога' }],
+    [{ text: '⏸ Пауза' }, { text: '▶️ Старт' }],
   ],
   resize_keyboard: true,
 };
@@ -22,6 +25,8 @@ const BUTTONS = {
   '⏸ Пауза': '/pause',
   '▶️ Старт': '/resume',
   '❓ Допомога': '/help',
+  '🏦 Біржі': '/exchanges',
+  '💵 Баланс': '/balance',
 };
 
 const HELP = `Команди:
@@ -36,6 +41,10 @@ const HELP = `Команди:
 /qty BTC 0.01 — входити рівно 0.01 BTC (0 = прибрати монету)
 /close <номер> — закрити пару (номер з /positions)
 /closeall — закрити всі пари
+/exchanges — біржі: підключення, кількість монет, ключі
+/balance — баланси і відкриті позиції на біржах
+/setkey <біржа> <apiKey> <secret> [passphrase] — додати API-ключ
+/delkey <біржа> — видалити ключ, доданий через Telegram
 /pause — не відкривати нові позиції (відкриті супроводжуються)
 /resume — відновити входи
 
@@ -137,7 +146,7 @@ class Telegram {
             log.warn(`Telegram: ігнорую повідомлення з чужого чату ${chatId}`);
             continue;
           }
-          this.handle(msg.text.trim(), chatId).catch((e) => this.send(`❌ ${e.message}`, chatId));
+          this.handle(msg.text.trim(), chatId, msg.message_id).catch((e) => this.send(`❌ ${e.message}`, chatId));
         }
       } catch (e) {
         log.warn(`Telegram polling: ${e.message}`);
@@ -146,7 +155,7 @@ class Telegram {
     }
   }
 
-  async handle(text, chatId) {
+  async handle(text, chatId, messageId) {
     const reply = (t) => this.send(t, chatId);
     const { cfg, settings, state, trader } = this.ctx;
     const line = BUTTONS[text] || text;
@@ -162,7 +171,7 @@ class Telegram {
       case '/positions':
         return reply(R.formatPositions(state, this.ctx.getRates(), cfg));
       case '/top':
-        return reply(R.formatOpps(this.ctx.getOpps(), cfg, 10));
+        return reply(R.formatOpps(this.ctx.getOpps(), cfg, 10, this.ctx.exchanges || {}));
       case '/report':
         return reply(R.formatDailyReport(cfg, state, state.dayKey(), this.ctx.getRates()));
       case '/history':
@@ -191,6 +200,71 @@ class Telegram {
         if (args.length < 2) return reply('Формат: /qty <монета> <кількість>');
         const c = settings.setQty(args[0], args[1]);
         return reply(cfg.coinQty[c] ? `✅ ${c}: вхід ${cfg.coinQty[c]} ${c}` : `✅ ${c} прибрано зі списку`);
+      }
+      case '/exchanges': {
+        const { all, initErrors, keys } = this.ctx;
+        const lines = SUPPORTED.concat(Object.keys(all).filter((id) => !META[id])).map((id) => {
+          const ex = all[id];
+          const src = keys.source(id);
+          const keyTxt = src ? `🔑 ${mask(keys.get(id).apiKey)} (${src})` : '— без ключа';
+          if (!ex) return `⚪ ${META[id] ? META[id].title : id}: вимкнена (EXCHANGES)`;
+          if (!ex.ready) return `🔴 ${ex.title}: не підключилась (${(initErrors[id] || '').slice(0, 80)}) ${keyTxt}`;
+          return `🟢 ${ex.title}: ${ex.perpSymbols().length} монет, ${keyTxt}`;
+        });
+        return reply(
+          `🏦 Біржі (${cfg.mode.toUpperCase()}):\n${lines.join('\n')}\n\n` +
+            `Дані (ставки, стакани) беруться з усіх 🟢. ${cfg.mode === 'live' ? 'Торгівля — лише між біржами з 🔑.' : 'У PAPER ордери не ставляться.'}\n` +
+            'Додати ключ: /setkey binance <apiKey> <secret>\nOKX/Bitget/KuCoin: /setkey okx <apiKey> <secret> <passphrase>'
+        );
+      }
+      case '/balance': {
+        const { exchanges } = this.ctx;
+        const withKeys = Object.values(exchanges).filter((e) => e.hasKeys);
+        if (!withKeys.length) return reply('Немає жодної біржі з API-ключем. /setkey');
+        const parts = await Promise.all(
+          withKeys.map(async (ex) => {
+            try {
+              const [b, ps] = await Promise.all([ex.balanceSummary(), ex.openPositions().catch(() => [])]);
+              const pos = ps.map((p) => `   ${p.canonical.split('/')[0]} ${p.side} ${p.contracts} контр. PnL ${(+(p.unrealizedPnl || 0).toFixed(4))}`).join('\n');
+              return `${ex.title}: вільно ${b.free.toFixed(2)} / всього ${b.total.toFixed(2)} ${b.currency}${pos ? `\n${pos}` : ''}`;
+            } catch (e) {
+              return `${ex.title}: ❌ ${e.message.slice(0, 120)}`;
+            }
+          })
+        );
+        return reply(`💵 Баланси ф'ючерсних рахунків:\n\n${parts.join('\n\n')}`);
+      }
+      case '/setkey': {
+        // Повідомлення з ключем одразу видаляємо з чату
+        if (messageId) this.api('deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => {});
+        const id = normalizeName(args[0]);
+        const meta = META[id];
+        const { all, exchanges, keys } = this.ctx;
+        if (!all[id]) return reply(`Біржа "${args[0]}" не увімкнена. Доступні: ${Object.keys(all).join(', ')}`);
+        if (args.length < 3) return reply(`Формат: /setkey ${id} <apiKey> <secret>${meta && meta.password ? ' <passphrase>' : ''}`);
+        if (meta && meta.password && !args[3]) return reply(`${meta.title} потребує passphrase: /setkey ${id} <apiKey> <secret> <passphrase>`);
+        const creds = { apiKey: args[1], secret: args[2], password: args[3] };
+        const ex = all[id];
+        const prev = keys.get(id);
+        ex.setCredentials(creds);
+        try {
+          if (!ex.ready) await ex.init();
+          exchanges[id] = ex;
+          const b = await ex.balanceSummary();
+          keys.set(id, creds);
+          return reply(`✅ Ключ ${ex.title} ${mask(creds.apiKey)} збережено і перевірено. Баланс: ${b.free.toFixed(2)} ${b.currency}\n(повідомлення з ключем видалено з чату)`);
+        } catch (e) {
+          ex.setCredentials(prev);
+          return reply(`❌ Ключ ${ex.title} не працює: ${e.message.slice(0, 200)}\nПідказка: ${(meta && meta.keyHint) || ''}`);
+        }
+      }
+      case '/delkey': {
+        const id = normalizeName(args[0]);
+        const { all, keys } = this.ctx;
+        if (!all[id]) return reply('Формат: /delkey <біржа>');
+        keys.remove(id);
+        all[id].setCredentials(keys.get(id)); // повертаємось до ключа з .env, якщо він є
+        return reply(`🗑 Ключ ${all[id].title}, доданий через Telegram, видалено.${keys.source(id) ? ' Діє ключ з .env.' : ''}`);
       }
       case '/pause':
         settings.setPaused(true);

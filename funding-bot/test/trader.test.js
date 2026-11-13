@@ -199,3 +199,12 @@ test('сповіщення: ордери, виплати, PnL угоди і за
   assert.match(msgs[1], /PnL угоди: \+1\.76/);
   assert.match(msgs[1], /Загальний PnL: \+1\.76/);
 });
+
+test('live: біржа без API-ключа — не торгуємо (лише дані)', async () => {
+  const { b, trader, window, state } = await setup({ mode: 'live' });
+  const w = await window();
+  b.setCredentials({});
+  assert.equal(await trader.tryOpen(w), false);
+  assert.equal(state.positions.length, 0);
+  assert.equal(b.client.orders.length, 0);
+});

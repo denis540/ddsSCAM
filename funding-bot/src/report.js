@@ -41,7 +41,7 @@ function formatPositions(state, rates, cfg) {
   return state.positions.map((p, i) => formatPosition(p, rates, i + 1, cfg)).join('\n\n');
 }
 
-function formatOpps(wins, cfg, n = 10) {
+function formatOpps(wins, cfg, n = 10, exchanges = {}) {
   if (!wins || !wins.length) return 'Вікон фандінгу, що проходять фільтри, зараз немає';
   const now = Date.now();
   const tz = cfg.timezone;
@@ -53,8 +53,10 @@ function formatOpps(wins, cfg, n = 10) {
         const ev = w.events
           .map((e) => `   ${clock(e.ts, tz)} ${e.ex} ${e.side.toUpperCase()} ${pct(e.rate, 4)}${e.est ? '≈' : ''} → ${sign(contrib(e) * 100, 4)}%`)
           .join('\n');
+        const noKeys = cfg.mode === 'live' && [w.shortEx, w.longEx].filter((id) => exchanges[id] && !exchanges[id].hasKeys);
+        const keysTxt = noKeys && noKeys.length ? `\n   ⚠️ немає ключа: ${noKeys.join(', ')} — торгівлі не буде` : '';
         return (
-          `${i + 1}. ${w.symbol}: SHORT ${w.shortEx} / LONG ${w.longEx}, старт через ${duration(w.startTs - now)}\n${ev}\n` +
+          `${i + 1}. ${w.symbol}: SHORT ${w.shortEx} / LONG ${w.longEx}, старт через ${duration(w.startTs - now)}${keysTxt}\n${ev}\n` +
           `   фандінг ${pct(w.funding)}${w.estimated ? ' (частково оцінка)' : ''}, комісії ${pct(w.fees)}, чистий ${pct(w.net)}`
         );
       })

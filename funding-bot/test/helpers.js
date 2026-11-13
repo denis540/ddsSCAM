@@ -12,7 +12,7 @@ function fakeClient({ contractSize = 1, step = 0.001, price = 100, rate = 0.0001
     funding: [],
     has: { fetchFundingRates: true, fetchFundingRate: true, fetchFundingHistory: true, setLeverage: true, fetchPositions: true },
     markets: {
-      [sym]: { symbol: sym, swap: true, linear: true, settle: 'USDT', quote: 'USDT', contractSize, taker,
+      [sym]: { symbol: sym, base: 'ETH', swap: true, linear: true, settle: 'USDT', quote: 'USDT', contractSize, taker,
         limits: { amount: { min: step }, cost: { min: 5 } } },
     },
     async loadMarkets() { return this.markets; },
@@ -41,9 +41,10 @@ function fakeClient({ contractSize = 1, step = 0.001, price = 100, rate = 0.0001
   return c;
 }
 
-async function makeExchange(id, opts) {
+async function makeExchange(id, opts = {}) {
   const client = fakeClient(opts);
-  const ex = new Exchange(id, {}, { client });
+  const creds = opts.noKeys ? {} : { apiKey: `${id}-key`, secret: 's' };
+  const ex = new Exchange(id, creds, { client });
   await ex.init();
   return ex;
 }

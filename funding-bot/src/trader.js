@@ -121,6 +121,8 @@ class Trader {
     if (this.skipped.has(key)) return false;
     const S = this.ex[shortEx];
     const L = this.ex[longEx];
+    if (!S || !L) return false;
+    if (!this.paper && (!S.hasKeys || !L.hasKeys)) return false; // торгуємо лише там, де додано API-ключі
     this.busy.add(symbol);
     const skip = (why) => {
       this.skipped.set(key, win.startTs);
@@ -167,7 +169,7 @@ class Trader {
       if (this.now() > win.startTs - this.cfg.entryMinSec * 1000) return skip('не встигли до виплати');
 
       // 3) Відкриття обох ніг
-      const legs = await this.executeOpen(symbol, S, L, sizing, pxS, pxL);
+      const legs = await this.executeOpen(symbol, S, L, sizing, pxS, pxL, leverage);
       if (!legs) return skip('не вдалося відкрити');
 
       const openedAt = this.now();
@@ -215,7 +217,7 @@ class Trader {
     }
   }
 
-  async executeOpen(symbol, S, L, sizing, pxS, pxL) {
+  async executeOpen(symbol, S, L, sizing, pxS, pxL, leverage = this.cfg.leverage) {
     if (this.paper) {
       const shortFee = sizing.base * pxS * S.takerFee(symbol);
       const longFee = sizing.base * pxL * L.takerFee(symbol);
@@ -229,9 +231,10 @@ class Trader {
       };
     }
     // Обидві ноги паралельно — мінімізуємо час, коли позиція не захеджована
+    const opts = { leverage, marginMode: this.cfg.marginMode };
     const [rs, rl] = await Promise.allSettled([
-      S.marketOrder(symbol, 'sell', sizing.cS),
-      L.marketOrder(symbol, 'buy', sizing.cL),
+      S.marketOrder(symbol, 'sell', sizing.cS, opts),
+      L.marketOrder(symbol, 'buy', sizing.cL, opts),
     ]);
     if (rs.status === 'fulfilled' && rl.status === 'fulfilled') {
       const short = rs.value;
@@ -250,11 +253,11 @@ class Trader {
     if (rl.status === 'rejected') failed.push(`LONG ${L.id}: ${rl.reason && rl.reason.message}`);
     const rollback = [];
     if (rs.status === 'fulfilled') {
-      const o = await this.closeLegWithRetry(S, symbol, 'buy', rs.value.filled);
+      const o = await this.closeLegWithRetry(S, symbol, 'buy', rs.value.filled, opts);
       if (o) rollback.push(this.orderLine('buy', S.id, symbol, S.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
     }
     if (rl.status === 'fulfilled') {
-      const o = await this.closeLegWithRetry(L, symbol, 'sell', rl.value.filled);
+      const o = await this.closeLegWithRetry(L, symbol, 'sell', rl.value.filled, opts);
       if (o) rollback.push(this.orderLine('sell', L.id, symbol, L.contractsToBase(symbol, o.filled), o.filled, o.average, o.fee));
     }
     await this.notify(`⚠️ ${symbol}: не вдалося відкрити пару, відкат.\n${failed.join('\n')}${rollback.length ? `\nВідкат:\n${rollback.join('\n')}` : ''}`);
@@ -280,10 +283,10 @@ class Trader {
     }
   }
 
-  async closeLegWithRetry(exchange, symbol, side, contracts, attempts = 4) {
+  async closeLegWithRetry(exchange, symbol, side, contracts, opts = {}, attempts = 4) {
     for (let i = 1; i <= attempts; i++) {
       try {
-        return await exchange.marketOrder(symbol, side, contracts, { reduceOnly: true });
+        return await exchange.marketOrder(symbol, side, contracts, { ...opts, reduceOnly: true });
       } catch (e) {
         log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}/${attempts}: ${e.message}`);
         await sleep(500 * 2 ** i);
@@ -433,7 +436,7 @@ class Trader {
         // Нога, закрита на попередній (частково невдалій) спробі, повторно не закривається
         const closeLeg = (ex, side, leg) =>
           leg.contracts > 0
-            ? this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts)
+            ? this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts, { leverage: pos.leverage, marginMode: this.cfg.marginMode })
             : Promise.resolve({ average: leg.exit, fee: leg.exitFee || 0, filled: 0 });
         const shortContracts = pos.short.contracts;
         const longContracts = pos.long.contracts;

@@ -24,17 +24,17 @@ const bool = (name, def) => {
 const mode = (process.env.MODE || 'paper').toLowerCase();
 if (!['paper', 'live'].includes(mode)) throw new Error('MODE має бути paper або live');
 
-const exchanges = list('EXCHANGES', ['binance', 'bybit', 'okx', 'bitget', 'gate']).map((s) => s.toLowerCase());
+const { SUPPORTED, normalizeName, META } = require('./exchanges-meta');
 
-// Ключі шукаються як BINANCE_API_KEY / BINANCE_SECRET / BINANCE_PASSWORD (passphrase для OKX/Bitget/KuCoin)
+const exchanges = [...new Set(list('EXCHANGES', SUPPORTED).map(normalizeName))];
+
+// Ключі: BINANCE_API_KEY / BINANCE_SECRET / BINANCE_PASSWORD (passphrase для OKX/Bitget/KuCoin).
+// Для HTX підходить і префікс HUOBI_, для KuCoin — KUCOINFUTURES_, для Kraken — KRAKENFUTURES_.
 const credentials = {};
 for (const id of exchanges) {
-  const p = id.toUpperCase();
-  credentials[id] = {
-    apiKey: process.env[`${p}_API_KEY`],
-    secret: process.env[`${p}_SECRET`],
-    password: process.env[`${p}_PASSWORD`],
-  };
+  const prefixes = [id, ...((META[id] && META[id].aliases) || []), META[id] ? META[id].ccxt : id].map((x) => x.toUpperCase());
+  const pick = (suffix) => prefixes.map((p) => process.env[`${p}_${suffix}`]).find(Boolean);
+  credentials[id] = { apiKey: pick('API_KEY'), secret: pick('SECRET'), password: pick('PASSWORD') || pick('PASSPHRASE') };
 }
 
 // COIN_QTY=BTC:0.01,ETH:0.2,SOL:5 — кількість монет на вхід для кожної монети
@@ -89,6 +89,7 @@ const config = {
   topN: num('TOP_N_LOG', 10),
   stateFile: process.env.STATE_FILE || 'data/state.json',
   settingsFile: process.env.SETTINGS_FILE || 'data/settings.json',
+  keysFile: process.env.KEYS_FILE || 'data/keys.json',
   paused: false,
 
   // Щоденний звіт
@@ -103,12 +104,5 @@ const config = {
 };
 
 if (!['coins', 'usdt'].includes(config.sizeMode)) throw new Error('SIZE_MODE має бути coins або usdt');
-
-if (config.mode === 'live') {
-  for (const id of exchanges) {
-    const c = credentials[id];
-    if (!c.apiKey || !c.secret) throw new Error(`MODE=live: немає ключів для ${id} (${id.toUpperCase()}_API_KEY / _SECRET)`);
-  }
-}
 
 module.exports = config;

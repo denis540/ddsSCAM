@@ -83,3 +83,46 @@ test('telegram: повідомлення з чужого чату ігнорую
   await tg.poll();
   assert.deepEqual(handled, [['/status', '42']]);
 });
+
+test('telegram: /setkey перевіряє ключ, зберігає, видаляє повідомлення; /delkey', async () => {
+  const { KeyStore } = require('../src/keys');
+  const { Exchange } = require('../src/exchange');
+  const { fakeClient } = require('./helpers');
+  const cfg = { ...mkCfg(), mode: 'live', exchanges: ['okx'], quote: 'USDT' };
+  const client = fakeClient();
+  let balanceOk = true;
+  client.fetchBalance = async () => { if (!balanceOk) throw new Error('Invalid API key'); return { free: { USDT: 77 }, total: { USDT: 80 } }; };
+  const okx = new Exchange('okx', {}, { client });
+  await okx.init();
+  const keys = new KeyStore({}, null);
+  const tg = new Telegram({ token: 't', chatIds: ['42'] });
+  const sent = [];
+  const api = [];
+  tg.send = async (t) => { sent.push(t); };
+  tg.api = async (m, b) => { api.push([m, b]); return {}; };
+  tg.ctx = { cfg, settings: new Settings(cfg, null), state: new State(null), trader: {}, keys, all: { okx }, exchanges: { okx }, initErrors: {},
+    getRates: () => ({}), getOpps: () => [], getLastScanAt: () => undefined };
+
+  await tg.handle('/setkey okx AAAA1111 SECRET', '42', 5);
+  assert.match(sent.at(-1), /потребує passphrase/);
+  await tg.handle('/setkey okx AAAA1111 SECRET PASS', '42', 6);
+  assert.deepEqual(api.filter(([m]) => m === 'deleteMessage').map(([, b]) => b.message_id), [5, 6]);
+  assert.match(sent.at(-1), /збережено і перевірено. Баланс: 77.00/);
+  assert.equal(keys.get('okx').password, 'PASS');
+  assert.ok(okx.hasKeys);
+
+  balanceOk = false;
+  await tg.handle('/setkey okx BAD BAD BAD', '42', 7);
+  assert.match(sent.at(-1), /не працює/);
+  assert.equal(keys.get('okx').apiKey, 'AAAA1111', 'невдалий ключ не перезаписує робочий');
+  assert.equal(okx.client.apiKey, 'AAAA1111');
+
+  balanceOk = true;
+  await tg.handle('🏦 Біржі', '42');
+  assert.match(sent.at(-1), /OKX: 1 монет, 🔑 AAAA…1111 \(telegram\)/);
+  assert.match(sent.at(-1), /Binance: вимкнена/);
+  await tg.handle('💵 Баланс', '42');
+  assert.match(sent.at(-1), /OKX: вільно 77.00/);
+  await tg.handle('/delkey okx', '42');
+  assert.ok(!okx.hasKeys);
+});

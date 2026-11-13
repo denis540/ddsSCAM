@@ -15,6 +15,7 @@ const { Trader } = require('./trader');
 const { State } = require('./state');
 const { Settings } = require('./settings');
 const { Telegram } = require('./telegram');
+const { KeyStore } = require('./keys');
 const { formatDailyReport } = require('./report');
 const { nowParts, clock, duration } = require('./time');
 
@@ -74,17 +75,44 @@ async function main() {
   log.info(`Старт. Режим: ${cfg.mode.toUpperCase()}${scanOnly ? ' (тільки сканування)' : ''}. Біржі: ${cfg.exchanges.join(', ')}`);
   if (cfg.mode === 'live') log.warn('LIVE-режим: бот виставлятиме реальні ордери!');
 
+  const keys = new KeyStore(cfg.credentials, cfg.keysFile);
+  // all — усі налаштовані біржі (у т.ч. ті, що поки не підключились); exchanges — робочі
+  const all = {};
   const exchanges = {};
+  const initErrors = {};
   for (const id of cfg.exchanges) {
     try {
-      const ex = new Exchange(id, cfg.credentials[id], { quote: cfg.quote, defaultTakerFee: cfg.defaultTakerFee });
-      await ex.init();
-      exchanges[id] = ex;
+      all[id] = new Exchange(id, keys.get(id), { quote: cfg.quote, defaultTakerFee: cfg.defaultTakerFee });
     } catch (e) {
-      log.error(`${id}: ініціалізація не вдалася: ${e.message}`);
+      initErrors[id] = e.message;
+      log.error(`${id}: ${e.message}`);
     }
   }
+  let lastInitTry = 0;
+  const initPending = async () => {
+    lastInitTry = Date.now();
+    await Promise.all(
+      Object.values(all)
+        .filter((ex) => !ex.ready)
+        .map(async (ex) => {
+          try {
+            await ex.init();
+            exchanges[ex.id] = ex;
+            delete initErrors[ex.id];
+          } catch (e) {
+            initErrors[ex.id] = e.message;
+            log.error(`${ex.title}: підключення не вдалося: ${e.message}`);
+          }
+        })
+    );
+  };
+  await initPending();
   if (Object.keys(exchanges).length < 2) throw new Error('Потрібно мінімум 2 робочі біржі');
+  if (cfg.mode === 'live') {
+    const withKeys = Object.values(exchanges).filter((e) => e.hasKeys).map((e) => e.id);
+    log.info(`Торгівля між біржами з ключами: ${withKeys.join(', ') || 'немає'}; решта — лише дані`);
+    if (withKeys.length < 2) log.warn('LIVE: потрібні ключі мінімум на 2 біржах (додайте у .env або /setkey у Telegram)');
+  }
 
   const trader = new Trader(cfg, exchanges, state, notify);
   const takerFee = (exId, symbol) => exchanges[exId].takerFee(symbol);
@@ -101,7 +129,7 @@ async function main() {
 
   if (!scanOnly) {
     await tg.start({
-      cfg, settings, state, trader,
+      cfg, settings, state, trader, keys, all, exchanges, initErrors,
       getRates: () => lastRates,
       getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
@@ -114,7 +142,7 @@ async function main() {
         : `${cfg.positionUsdt} ${cfg.quote}`;
     await notify(
       `🚀 Бот запущено (${cfg.mode.toUpperCase()})${cfg.paused ? ' — ⏸ на паузі' : ''}\n` +
-        `Біржі: ${Object.keys(exchanges).join(', ')}\n` +
+        `Біржі: ${Object.values(all).map((e) => `${e.ready ? '🟢' : '🔴'}${e.id}${e.hasKeys ? '🔑' : ''}`).join(' ')}\n` +
         `Вхід: ${qtyInfo}, плече x${cfg.leverage}, макс. пар ${cfg.maxPositions}\n` +
         `Поріг: фандінг > ${pct(cfg.minFunding)}, чистий > ${pct(cfg.minProfit)}\n` +
         `Вхід за ${cfg.entryBeforeSec} с до виплати, вихід через ${cfg.exitAfterSec} с після або при сходженні цін\n` +
@@ -133,6 +161,7 @@ async function main() {
   process.on('SIGTERM', stop);
 
   const scan = async () => {
+    if (Object.keys(exchanges).length < Object.keys(all).length && Date.now() - lastInitTry > 5 * 60000) await initPending();
     const rates = await fetchAllRates(exchanges);
     let wins = planWindows(rates, cfg, takerFee);
     // У режимі монет торгуємо лише ті монети, для яких задано кількість
