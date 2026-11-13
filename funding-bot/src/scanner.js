@@ -85,7 +85,11 @@ function buildWindow({ symbol, shortEx, longEx, s, l, startTs, endTs, now, cfg, 
  * Усі вікна, що проходять фільтри. Для кожної (монета, short, long, start) — найкраще за чистим профітом.
  * @param {(exId:string, symbol:string)=>number} takerFee
  */
-function planWindows(ratesByExchange, cfg, takerFee = () => cfg.defaultTakerFee, now = Date.now()) {
+/**
+ * @param {(coin:string, exA:string, exB:string, markA?:number, markB?:number)=>{ok:boolean}} [coinCheck]
+ *        перевірка, що це та сама монета (адреса контракту / ціна / ручні рішення)
+ */
+function planWindows(ratesByExchange, cfg, takerFee = () => cfg.defaultTakerFee, now = Date.now(), coinCheck) {
   const maxWin = cfg.maxWindowHours * HOUR;
   const horizon = maxWin + (cfg.lookaheadHours || 8) * HOUR;
   const minStart = now + (cfg.entryMinSec || 0) * 1000;
@@ -107,6 +111,11 @@ function planWindows(ratesByExchange, cfg, takerFee = () => cfg.defaultTakerFee,
     for (const S of entries) {
       for (const L of entries) {
         if (S.exId === L.exId) continue;
+        if (coinCheck) {
+          if (!coinCheck(base(symbol), S.exId, L.exId, S.r.mark, L.r.mark).ok) continue;
+        } else if (cfg.coinPriceTol && S.r.mark && L.r.mark && Math.abs(S.r.mark - L.r.mark) / Math.min(S.r.mark, L.r.mark) > cfg.coinPriceTol) {
+          continue; // ціни надто різні — різні монети з однаковою назвою
+        }
         // Швидке відсікання: навіть максимум можливого фандінгу не дотягує до порогу
         const nS = cfg.allowEstimated ? Math.ceil(maxWin / ((S.r.intervalH || 8) * HOUR)) + 1 : 1;
         const nL = cfg.allowEstimated ? Math.ceil(maxWin / ((L.r.intervalH || 8) * HOUR)) + 1 : 1;

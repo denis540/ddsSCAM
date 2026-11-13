@@ -16,6 +16,7 @@ const { State } = require('./state');
 const { Settings } = require('./settings');
 const { Telegram } = require('./telegram');
 const { KeyStore } = require('./keys');
+const { CoinRegistry } = require('./coins');
 const { formatDailyReport } = require('./report');
 const { nowParts, clock, duration } = require('./time');
 
@@ -89,6 +90,7 @@ async function main() {
     }
   }
   let lastInitTry = 0;
+  let trader; // створюється нижче; initPending викликається і до, і після
   const initPending = async () => {
     lastInitTry = Date.now();
     await Promise.all(
@@ -99,6 +101,7 @@ async function main() {
             await ex.init();
             exchanges[ex.id] = ex;
             delete initErrors[ex.id];
+            if (trader && trader.coins) trader.coins.load(ex).catch(() => {});
           } catch (e) {
             initErrors[ex.id] = e.message;
             log.error(`${ex.title}: підключення не вдалося: ${e.message}`);
@@ -114,8 +117,19 @@ async function main() {
     if (withKeys.length < 2) log.warn('LIVE: потрібні ключі мінімум на 2 біржах (додайте у .env або /setkey у Telegram)');
   }
 
-  const trader = new Trader(cfg, exchanges, state, notify);
+  trader = new Trader(cfg, exchanges, state, notify);
   const takerFee = (exId, symbol) => exchanges[exId].takerFee(symbol);
+
+  // Перевірка монет: адреси контрактів з бірж (у фоні, оновлення раз на 6 год)
+  const coins = new CoinRegistry(cfg, cfg.coinsFile);
+  trader.coins = coins;
+  let coinsLoadedAt = 0;
+  const refreshCoins = () => {
+    coinsLoadedAt = Date.now();
+    coins.loadAll(exchanges).catch((e) => log.warn(`Адреси монет: ${e.message}`));
+  };
+  refreshCoins();
+  const coinCheck = (coin, a, b, ma, mb) => coins.check(coin, a, b, ma, mb);
 
   let lastRates = {};
   let lastWindows = [];
@@ -129,7 +143,7 @@ async function main() {
 
   if (!scanOnly) {
     await tg.start({
-      cfg, settings, state, trader, keys, all, exchanges, initErrors,
+      cfg, settings, state, trader, keys, all, exchanges, initErrors, coins,
       getRates: () => lastRates,
       getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
@@ -163,7 +177,8 @@ async function main() {
   const scan = async () => {
     if (Object.keys(exchanges).length < Object.keys(all).length && Date.now() - lastInitTry > 5 * 60000) await initPending();
     const rates = await fetchAllRates(exchanges);
-    let wins = planWindows(rates, cfg, takerFee);
+    if (Date.now() - coinsLoadedAt > 6 * 3600000) refreshCoins();
+    let wins = planWindows(rates, cfg, takerFee, Date.now(), coinCheck);
     // У режимі монет торгуємо лише ті монети, для яких задано кількість
     if (cfg.sizeMode === 'coins') wins = wins.filter((w) => cfg.coinQty[coinOf(w.symbol)] > 0);
     lastRates = rates;

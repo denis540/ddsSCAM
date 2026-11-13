@@ -89,7 +89,7 @@ class Trader {
   }
 
   orderLine(side, exId, symbol, base, contracts, price, fee) {
-    const cs = this.ex[exId].market(symbol).contractSize || 1;
+    const cs = this.ex[exId].unitSize(symbol);
     const contractsTxt = cs !== 1 ? ` (${fmt(contracts, 6)} контр.)` : '';
     return (
       `${side === 'sell' ? '🔴 SELL' : '🟢 BUY'} ${fmt(base, 8)} ${coinOf(symbol)}${contractsTxt} @ ${fmt(price, 8)} на ${exId}` +
@@ -145,10 +145,16 @@ class Trader {
       const mid = (bidS + askL) / 2;
       const sizing = this.sizePair(symbol, S, L, mid, this.targetBase(symbol, mid));
       if (sizing.error) return skip(sizing.error);
-      const pxS = vwap(obS.bids, sizing.base, S.market(symbol).contractSize || 1);
-      const pxL = vwap(obL.asks, sizing.base, L.market(symbol).contractSize || 1);
+      const pxS = vwap(obS.bids, sizing.base, S.unitSize(symbol));
+      const pxL = vwap(obL.asks, sizing.base, L.unitSize(symbol));
       if (!pxS || !pxL) return skip('не вистачає ліквідності');
       if ((bidS - pxS) / bidS > this.cfg.maxSlippagePct || (pxL - askL) / askL > this.cfg.maxSlippagePct) return skip('слипедж більший за ліміт');
+      if (this.coins) {
+        const chk = this.coins.check(coinOf(symbol), shortEx, longEx, pxS, pxL);
+        if (!chk.ok) return skip(`монета: ${chk.reason}`);
+      } else if (Math.abs(pxS - pxL) / Math.min(pxS, pxL) > (this.cfg.coinPriceTol ?? 0.03)) {
+        return skip('ціни надто різні — схоже, різні монети');
+      }
       const basis = (pxS - pxL) / pxL; // >0: шортимо дорожче, ніж купуємо
       if (basis < -this.cfg.maxEntryBasisPct) return skip(`несприятлива різниця цін ${pct(basis)}`);
       const net = fresh.funding - fees + Math.min(basis, 0);
@@ -330,8 +336,8 @@ class Trader {
     const S = this.ex[pos.shortEx];
     const L = this.ex[pos.longEx];
     const [obS, obL] = await Promise.all([S.fetchOrderBook(pos.symbol), L.fetchOrderBook(pos.symbol)]);
-    const askS = vwap(obS.asks, pos.base, S.market(pos.symbol).contractSize || 1) || (obS.asks[0] && obS.asks[0][0]);
-    const bidL = vwap(obL.bids, pos.base, L.market(pos.symbol).contractSize || 1) || (obL.bids[0] && obL.bids[0][0]);
+    const askS = vwap(obS.asks, pos.base, S.unitSize(pos.symbol)) || (obS.asks[0] && obS.asks[0][0]);
+    const bidL = vwap(obL.bids, pos.base, L.unitSize(pos.symbol)) || (obL.bids[0] && obL.bids[0][0]);
     if (!askS || !bidL) return undefined;
     const exitBasis = (askS - bidL) / bidL;
     const pricePnl = (pos.short.entry - askS) * pos.base + (bidL - pos.long.entry) * pos.base;

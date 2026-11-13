@@ -8,28 +8,30 @@ const path = require('path');
  * type pct — користувач вводить у відсотках (0.1 = 0.1%), у cfg зберігається частка (0.001).
  */
 const SCHEMA = {
-  minfunding: { field: 'minFunding', type: 'pct', min: 0, desc: 'Вхід, лише якщо фандінг за виплату(и) більший за, % (напр. OKX 3% − Binance 1% = 2%)' },
-  minprofit: { field: 'minProfit', type: 'pct', desc: 'Мін. чистий профіт після 4 комісій, %' },
-  entrybefore: { field: 'entryBeforeSec', type: 'int', min: 10, max: 3600, desc: 'Заходити за N секунд до виплати' },
-  entrymin: { field: 'entryMinSec', type: 'int', min: 3, max: 600, desc: 'Не заходити, якщо до виплати менше N секунд' },
-  exitafter: { field: 'exitAfterSec', type: 'int', min: 0, max: 3600, desc: 'Виходити через N секунд після виплати' },
-  converge: { field: 'convergePct', type: 'pct', min: 0, desc: 'Ціни зійшлися, якщо різниця між біржами ≤ %' },
-  earlyexit: { field: 'earlyExit', type: 'bool', desc: 'Вийти ДО виплати, якщо прибуток від цін уже більший за фандінг (on/off)' },
-  maxwindow: { field: 'maxWindowHours', type: 'num', min: 0, max: 24, desc: 'Макс. годин між першою і останньою виплатою у вікні (0 = лише одночасні/одна виплата)' },
-  estimated: { field: 'allowEstimated', type: 'bool', desc: 'Враховувати наступні виплати за поточною ставкою (on/off)' },
-  sizemode: { field: 'sizeMode', type: 'enum', values: ['coins', 'usdt'], desc: 'Розмір входу: coins (кількість монет) або usdt' },
-  usdt: { field: 'positionUsdt', type: 'num', min: 1, desc: 'Сума входу на кожну ногу, USDT (для sizemode=usdt)' },
-  leverage: { field: 'leverage', type: 'int', min: 1, max: 125, desc: 'Плече для нових позицій' },
-  marginmode: { field: 'marginMode', type: 'enum', values: ['isolated', 'cross'], desc: 'Режим маржі' },
-  maxpos: { field: 'maxPositions', type: 'int', min: 0, max: 100, desc: 'Макс. одночасно відкритих пар' },
-  basis: { field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами на вході, %' },
-  slippage: { field: 'maxSlippagePct', type: 'pct', min: 0, desc: 'Макс. слипедж по стакану, %' },
-  liqbuffer: { field: 'liqBufferPct', type: 'pct', min: 1, max: 90, desc: 'Закрити, якщо до ліквідації менше, %' },
-  maxrate: { field: 'maxAbsFundingRate', type: 'pct', min: 0, desc: 'Ігнорувати ставки фандінгу більші за, % (аномалії)' },
-  interval: { field: 'scanIntervalSec', type: 'int', min: 10, desc: 'Інтервал оновлення ставок, сек' },
-  reporttime: { field: 'reportTime', type: 'time', desc: 'Час щоденного звіту, HH:MM' },
-  whitelist: { field: 'whitelist', type: 'list', desc: 'Тільки ці монети (через кому, "-" = усі)' },
-  blacklist: { field: 'blacklist', type: 'list', desc: 'Ніколи не торгувати ці монети ("-" = очистити)' },
+  minfunding: { label: 'Мін. фандінг', field: 'minFunding', type: 'pct', min: 0, desc: 'Вхід, лише якщо фандінг за виплату(и) більший за, % (напр. OKX 3% − Binance 1% = 2%)' },
+  minprofit: { label: 'Мін. чистий профіт', field: 'minProfit', type: 'pct', desc: 'Мін. чистий профіт після 4 комісій, %' },
+  entrybefore: { label: 'Вхід до виплати, с', field: 'entryBeforeSec', type: 'int', min: 10, max: 3600, desc: 'Заходити за N секунд до виплати' },
+  entrymin: { label: 'Найпізніший вхід, с', field: 'entryMinSec', type: 'int', min: 3, max: 600, desc: 'Не заходити, якщо до виплати менше N секунд' },
+  exitafter: { label: 'Вихід після виплати, с', field: 'exitAfterSec', type: 'int', min: 0, max: 3600, desc: 'Виходити через N секунд після виплати' },
+  converge: { label: 'Ціни зійшлися при', field: 'convergePct', type: 'pct', min: 0, desc: 'Ціни зійшлися, якщо різниця між біржами ≤ %' },
+  earlyexit: { label: 'Ранній вихід', field: 'earlyExit', type: 'bool', desc: 'Вийти ДО виплати, якщо прибуток від цін уже більший за фандінг (on/off)' },
+  maxwindow: { label: 'Макс. вікно, год', field: 'maxWindowHours', type: 'num', min: 0, max: 24, desc: 'Макс. годин між першою і останньою виплатою у вікні (0 = лише одночасні/одна виплата)' },
+  estimated: { label: 'Оціночні виплати', field: 'allowEstimated', type: 'bool', desc: 'Враховувати наступні виплати за поточною ставкою (on/off)' },
+  sizemode: { label: 'Режим розміру', field: 'sizeMode', type: 'enum', values: ['coins', 'usdt'], desc: 'Розмір входу: coins (кількість монет) або usdt' },
+  usdt: { label: 'Сума входу USDT', field: 'positionUsdt', type: 'num', min: 1, desc: 'Сума входу на кожну ногу, USDT (для sizemode=usdt)' },
+  leverage: { label: 'Плече', field: 'leverage', type: 'int', min: 1, max: 125, desc: 'Плече для нових позицій' },
+  marginmode: { label: 'Режим маржі', field: 'marginMode', type: 'enum', values: ['isolated', 'cross'], desc: 'Режим маржі' },
+  maxpos: { label: 'Макс. позицій', field: 'maxPositions', type: 'int', min: 0, max: 100, desc: 'Макс. одночасно відкритих пар' },
+  basis: { label: 'Макс. різниця цін на вході', field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами на вході, %' },
+  slippage: { label: 'Макс. слипедж', field: 'maxSlippagePct', type: 'pct', min: 0, desc: 'Макс. слипедж по стакану, %' },
+  liqbuffer: { label: 'Запас до ліквідації', field: 'liqBufferPct', type: 'pct', min: 1, max: 90, desc: 'Закрити, якщо до ліквідації менше, %' },
+  maxrate: { label: 'Макс. ставка (аномалії)', field: 'maxAbsFundingRate', type: 'pct', min: 0, desc: 'Ігнорувати ставки фандінгу більші за, % (аномалії)' },
+  interval: { label: 'Оновлення ставок, с', field: 'scanIntervalSec', type: 'int', min: 10, desc: 'Інтервал оновлення ставок, сек' },
+  pricetol: { label: 'Допуск ціни монет', field: 'coinPriceTol', type: 'pct', min: 0.1, max: 50, desc: 'Якщо ціни монети на біржах відрізняються більше — це різні монети, %' },
+  strictcoins: { label: 'Лише підтверджені монети', field: 'strictCoins', type: 'bool', desc: 'Торгувати лише монети з однаковою адресою контракту на обох біржах (on/off)' },
+  reporttime: { label: 'Час звіту', field: 'reportTime', type: 'time', desc: 'Час щоденного звіту, HH:MM' },
+  whitelist: { label: 'Тільки монети', field: 'whitelist', type: 'list', desc: 'Тільки ці монети (через кому, "-" = усі)' },
+  blacklist: { label: 'Чорний список', field: 'blacklist', type: 'list', desc: 'Ніколи не торгувати ці монети ("-" = очистити)' },
 };
 
 function parse(def, raw) {
@@ -43,7 +45,7 @@ function parse(def, raw) {
       if (def.type === 'int' && !Number.isInteger(n)) throw new Error('потрібне ціле число');
       if (def.min !== undefined && n < def.min) throw new Error(`мінімум ${def.min}`);
       if (def.max !== undefined && n > def.max) throw new Error(`максимум ${def.max}`);
-      return def.type === 'pct' ? n / 100 : n;
+      return def.type === 'pct' ? Number((n / 100).toPrecision(12)) : n;
     }
     case 'enum':
       if (!def.values.includes(s.toLowerCase())) throw new Error(`допустимо: ${def.values.join(', ')}`);
@@ -135,4 +137,4 @@ class Settings {
   }
 }
 
-module.exports = { Settings, SCHEMA };
+module.exports = { Settings, SCHEMA, display };

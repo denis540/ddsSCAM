@@ -79,6 +79,11 @@ const config = {
   earlyExit: bool('EARLY_EXIT', true), // вийти ще ДО виплати, якщо прибуток від цін уже більший за очікуваний фандінг
   liqBufferPct: num('LIQ_BUFFER_PCT', 15) / 100, // закриваємо пару, якщо до ліквідації менше X%
 
+  // Перевірка, що монети з однаковою назвою — одна й та сама монета
+  coinPriceTol: num('COIN_PRICE_TOL_PCT', 3) / 100, // різниця цін більша — вважаємо різними монетами
+  strictCoins: bool('STRICT_COINS', false), // торгувати лише монети з підтвердженою адресою контракту
+  coinsFile: process.env.COINS_FILE || 'data/coins.json',
+
   // Фільтри
   whitelist: list('WHITELIST'), // напр. BTC,ETH,SOL
   blacklist: list('BLACKLIST'),

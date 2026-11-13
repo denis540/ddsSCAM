@@ -32,6 +32,19 @@ function parseIntervalHours(fr, cachedIntervals) {
 const canonical = (base) => `${base}/USDT:USDT`;
 
 /**
+ * Множник у назві монети: 1000PEPE = 1000 PEPE, 1MBABYDOGE = 1 000 000 BABYDOGE.
+ * @returns {{coin:string, mult:number}}
+ */
+function parseMultiplier(base) {
+  const b = String(base);
+  let m = b.match(/^(10|100|1000|10000|100000|1000000|10000000|100000000|1000000000)([A-Z][A-Z0-9]*)$/);
+  if (m) return { coin: m[2], mult: Number(m[1]) };
+  m = b.match(/^1M([A-Z][A-Z0-9]*)$/);
+  if (m) return { coin: m[1], mult: 1e6 };
+  return { coin: b, mult: 1 };
+}
+
+/**
  * Обгортка над ccxt-біржею: лінійні перпетуали, уніфіковані методи для бота.
  * Усі методи приймають канонічний символ і самі перекладають його в символ біржі.
  */
@@ -54,6 +67,7 @@ class Exchange {
     this.leverageSet = new Set();
     this.native = {}; // канонічний -> символ біржі
     this.fromNative = {}; // символ біржі -> канонічний
+    this.mult = {}; // канонічний -> множник (1000 для 1000PEPE)
     this.ready = false;
   }
 
@@ -87,7 +101,10 @@ class Exchange {
     log.info(`${this.title}: завантажено ${this.perpSymbols().length} перпетуалів${this.hasKeys ? ', API-ключ є' : ', без ключа (лише дані)'}`);
   }
 
-  /** Обирає для кожної монети один лінійний перпетуал (за пріоритетом валюти розрахунку). */
+  /**
+   * Обирає для кожної монети один лінійний перпетуал: пріоритет валюти розрахунку,
+   * потім контракт без множника (PEPE краще за 1000PEPE).
+   */
   buildSymbolMap() {
     const settles = this.meta.settles || [this.quote];
     const chosen = {};
@@ -95,16 +112,26 @@ class Exchange {
       if (!m.swap || !m.linear || m.active === false) continue;
       const rank = settles.indexOf(m.settle);
       if (rank < 0 || m.quote !== m.settle) continue;
-      const prev = chosen[m.base];
-      if (!prev || rank < prev.rank) chosen[m.base] = { symbol: m.symbol, rank };
+      const { coin, mult } = parseMultiplier(m.base);
+      const prev = chosen[coin];
+      if (!prev || rank < prev.rank || (rank === prev.rank && mult < prev.mult)) chosen[coin] = { symbol: m.symbol, rank, mult, base: m.base };
     }
     this.native = {};
     this.fromNative = {};
-    for (const [base, { symbol }] of Object.entries(chosen)) {
-      const c = canonical(base);
+    this.mult = {};
+    this.marketBase = {};
+    for (const [coin, { symbol, mult, base }] of Object.entries(chosen)) {
+      const c = canonical(coin);
       this.native[c] = symbol;
       this.fromNative[symbol] = c;
+      this.mult[c] = mult;
+      this.marketBase[c] = base;
     }
+  }
+
+  /** Скільки справжніх монет в одному контракті (contractSize × множник). */
+  unitSize(symbol) {
+    return (this.market(symbol).contractSize || 1) * (this.mult[symbol] || 1);
   }
 
   perpSymbols() {
@@ -149,13 +176,13 @@ class Exchange {
     for (const [sym, fr] of Object.entries(raw)) {
       const c = this.fromNative[fr.symbol || sym];
       if (!c) continue;
-      const r = this.normalizeRate(fr, fr.symbol || sym);
+      const r = this.normalizeRate(fr, fr.symbol || sym, Date.now(), this.mult[c]);
       if (r) out[c] = r;
     }
     return out;
   }
 
-  normalizeRate(fr, nativeSymbol, now = Date.now()) {
+  normalizeRate(fr, nativeSymbol, now = Date.now(), mult = 1) {
     if (!fr || !Number.isFinite(fr.fundingRate)) return undefined;
     const intervalH = parseIntervalHours({ ...fr, symbol: nativeSymbol }, this.intervals);
     // У ccxt fundingTimestamp — час НАЙБЛИЖЧОЇ виплати, nextFundingTimestamp — наступної за нею (OKX)
@@ -164,15 +191,17 @@ class Exchange {
       const iv = intervalH * HOUR;
       nextTs = Math.floor(now / iv) * iv + iv; // напр. Kraken: щогодини рівно о :00 UTC
     }
-    return { rate: fr.fundingRate, intervalH, nextTs, mark: fr.markPrice || fr.indexPrice };
+    const mark = fr.markPrice || fr.indexPrice;
+    return { rate: fr.fundingRate, intervalH, nextTs, mark: mark ? mark / (mult || 1) : undefined }; // ціна за 1 монету
   }
 
   /** Свіжа ставка по одному символу (перед самим входом). */
   async fetchFundingRate(symbol) {
     const s = this.n(symbol);
-    if (this.client.has.fetchFundingRate) return this.normalizeRate(await this.client.fetchFundingRate(s), s);
+    const mult = this.mult[symbol] || 1;
+    if (this.client.has.fetchFundingRate) return this.normalizeRate(await this.client.fetchFundingRate(s), s, Date.now(), mult);
     const all = await this.client.fetchFundingRates([s]);
-    return this.normalizeRate(all[s], s);
+    return this.normalizeRate(all[s], s, Date.now(), mult);
   }
 
   /** Фактично отриманий (+) / сплачений (−) фандінг з біржі з моменту since. undefined — якщо біржа не віддала. */
@@ -184,23 +213,27 @@ class Exchange {
     return rows.filter((r) => (!r.symbol || r.symbol === s) && r.timestamp >= since).reduce((a, r) => a + (r.amount || 0), 0);
   }
 
+  /** Стакан: ціни — за 1 монету (з урахуванням множника), обсяги — у контрактах. */
   async fetchOrderBook(symbol, limit = 20) {
-    return this.client.fetchOrderBook(this.n(symbol), limit);
+    const ob = await this.client.fetchOrderBook(this.n(symbol), limit);
+    const mult = this.mult[symbol] || 1;
+    if (mult === 1) return ob;
+    const conv = (lv) => lv.map(([p, a]) => [p / mult, a]);
+    return { ...ob, bids: conv(ob.bids || []), asks: conv(ob.asks || []) };
   }
 
-  /** Кількість базової монети -> кількість контрактів (з округленням вниз до кроку біржі). */
+  /** Кількість монет -> кількість контрактів (з округленням вниз до кроку біржі). */
   baseToContracts(symbol, baseAmount) {
-    const cs = this.market(symbol).contractSize || 1;
-    return Number(this.client.amountToPrecision(this.n(symbol), baseAmount / cs));
+    return Number(this.client.amountToPrecision(this.n(symbol), baseAmount / this.unitSize(symbol)));
   }
 
   contractsToBase(symbol, contracts) {
-    return contracts * (this.market(symbol).contractSize || 1);
+    return contracts * this.unitSize(symbol);
   }
 
   minBaseAmount(symbol, price) {
     const m = this.market(symbol);
-    const cs = m.contractSize || 1;
+    const cs = this.unitSize(symbol);
     const minContracts = (m.limits && m.limits.amount && m.limits.amount.min) || 0;
     const minCost = (m.limits && m.limits.cost && m.limits.cost.min) || 0;
     return Math.max(minContracts * cs, price ? minCost / price : 0);
@@ -276,7 +309,7 @@ class Exchange {
     return {
       id: o.id,
       filled: Number.isFinite(o.filled) && o.filled > 0 ? o.filled : contracts,
-      average: o.average || o.price,
+      average: (o.average || o.price) ? (o.average || o.price) / (this.mult[symbol] || 1) : undefined,
       fee: o.fee && [settle, this.quote].includes(o.fee.currency) ? o.fee.cost : undefined,
     };
   }
@@ -289,4 +322,4 @@ class Exchange {
   }
 }
 
-module.exports = { Exchange, parseIntervalHours, canonical };
+module.exports = { Exchange, parseIntervalHours, canonical, parseMultiplier };

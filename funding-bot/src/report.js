@@ -113,4 +113,4 @@ function formatHistory(state, n = 10, quote = 'USDT') {
     .join('\n');
 }
 
-module.exports = { formatPositions, formatOpps, formatStatus, formatDailyReport, formatHistory, unrealized };
+module.exports = { formatPositions, formatOpps, formatStatus, formatDailyReport, formatHistory, unrealized, pct, fmt, sign };

@@ -48,7 +48,8 @@ test('telegram: команди змінюють налаштування', async
   const state = new State(null, 'Europe/Kyiv');
   const tg = new Telegram({ token: 't', chatIds: ['42'] });
   const sent = [];
-  tg.send = async (t) => { sent.push(t); };
+  const marks = [];
+  tg.send = async (t, c, m) => { sent.push(t); marks.push(m); };
   tg.ctx = { cfg, settings, state, trader: {}, getRates: () => ({}), getOpps: () => [], getLastScanAt: () => undefined };
 
   await tg.handle('/set minfunding 2', '42');
@@ -64,7 +65,8 @@ test('telegram: команди змінюють налаштування', async
   await tg.handle('💰 Звіт', '42');
   assert.match(sent.at(-1), /ЗАГАЛЬНИЙ PnL/);
   await tg.handle('/settings', '42');
-  assert.match(sent.at(-1), /minfunding = 2%/);
+  const labels = marks.at(-1).inline_keyboard.flat().map((b) => b.text);
+  assert.ok(labels.includes('Мін. фандінг: 2%'), labels.join(' | '));
 });
 
 test('telegram: повідомлення з чужого чату ігноруються', async () => {
