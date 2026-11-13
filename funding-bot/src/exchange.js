@@ -214,8 +214,8 @@ class Exchange {
   }
 
   /** Стакан: ціни — за 1 монету (з урахуванням множника), обсяги — у контрактах. */
-  async fetchOrderBook(symbol, limit = 20) {
-    const ob = await this.client.fetchOrderBook(this.n(symbol), limit);
+  async fetchOrderBook(symbol, limit = this.meta.obLimit === undefined ? 50 : this.meta.obLimit) {
+    const ob = await this.client.fetchOrderBook(this.n(symbol), limit ?? undefined);
     const mult = this.mult[symbol] || 1;
     if (mult === 1) return ob;
     const conv = (lv) => lv.map(([p, a]) => [p / mult, a]);
@@ -228,7 +228,7 @@ class Exchange {
   }
 
   contractsToBase(symbol, contracts) {
-    return contracts * this.unitSize(symbol);
+    return Number((contracts * this.unitSize(symbol)).toPrecision(12)); // без хвостів float (33 × 0.1)
   }
 
   minBaseAmount(symbol, price) {

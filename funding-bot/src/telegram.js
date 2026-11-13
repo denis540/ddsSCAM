@@ -464,8 +464,24 @@ class Telegram {
         return reply(R.formatStatus(cfg, state, this.ctx.getRates(), this.ctx.getLastScanAt()), inline([[btn('📈 Позиції', 'c:/positions'), btn('🏠 Меню', 'm')]]));
       case '/positions':
         return reply(R.formatPositions(state, this.ctx.getRates(), cfg), state.positions.length ? inline([[btn('🛑 Закрити позицію', 'closemenu'), btn('🏠 Меню', 'm')]]) : undefined);
-      case '/top':
-        return reply(R.formatOpps(this.ctx.getOpps(), cfg, 10, this.ctx.exchanges || {}));
+      case '/top': {
+        // Для 5 найкращих — дивимось стакани: на яку суму реально можна зайти зараз
+        const wins = this.ctx.getOpps().slice(0, 10);
+        const caps = {};
+        if (trader && trader.estimateCapacity) {
+          await Promise.all(
+            wins.slice(0, 5).map(async (w, i) => {
+              try {
+                const c = await trader.estimateCapacity(w);
+                if (!c.error) caps[i] = c;
+              } catch (e) {
+                log.debug(`capacity ${w.symbol}: ${e.message}`);
+              }
+            })
+          );
+        }
+        return reply(R.formatOpps(wins, cfg, 10, this.ctx.exchanges || {}, caps));
+      }
       case '/report':
         return reply(R.formatDailyReport(cfg, state, state.dayKey(), this.ctx.getRates()));
       case '/history':

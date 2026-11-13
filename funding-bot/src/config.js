@@ -52,8 +52,12 @@ const config = {
   quote: process.env.QUOTE || 'USDT',
 
   // Розмір і ризик
-  // coins — вхід/вихід фіксованою кількістю монет (COIN_QTY / команда /qty), usdt — сумою POSITION_USDT
-  sizeMode: (process.env.SIZE_MODE || 'coins').toLowerCase(),
+  // auto  — бот сам рахує по стаканах обох бірж, на яку суму можна зайти, але не більше MAX_TRADE_USDT
+  // coins — вхід/вихід фіксованою кількістю монет (COIN_QTY / команда /qty), usdt — фіксованою сумою POSITION_USDT
+  sizeMode: (process.env.SIZE_MODE || 'auto').toLowerCase(),
+  maxTradeUsdt: num('MAX_TRADE_USDT', 500), // ваш максимум на 1 угоду (на кожну ногу), USDT
+  minTradeUsdt: num('MIN_TRADE_USDT', 20), // якщо стакан дозволяє менше — угоду пропускаємо
+  checkExitDepth: bool('CHECK_EXIT_DEPTH', true), // враховувати і стакан на вихід
   coinQty,
   positionUsdt: num('POSITION_USDT', 100), // номінал КОЖНОЇ ноги (для SIZE_MODE=usdt)
   leverage: num('LEVERAGE', 3),
@@ -108,6 +112,6 @@ const config = {
   },
 };
 
-if (!['coins', 'usdt'].includes(config.sizeMode)) throw new Error('SIZE_MODE має бути coins або usdt');
+if (!['auto', 'coins', 'usdt'].includes(config.sizeMode)) throw new Error('SIZE_MODE має бути auto, coins або usdt');
 
 module.exports = config;

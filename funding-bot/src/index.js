@@ -149,7 +149,9 @@ async function main() {
       getLastScanAt: () => lastScanAt,
     });
     const qtyInfo =
-      cfg.sizeMode === 'coins'
+      cfg.sizeMode === 'auto'
+        ? `авто за стаканом, до ${cfg.maxTradeUsdt} ${cfg.quote} на угоду`
+        : cfg.sizeMode === 'coins'
         ? Object.keys(cfg.coinQty).length
           ? `монети: ${Object.entries(cfg.coinQty).map(([c, q]) => `${c} ${q}`).join(', ')}`
           : 'монети — ⚠️ не задано жодної, задайте /qty BTC 0.01'

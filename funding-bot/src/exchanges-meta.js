@@ -7,6 +7,7 @@
  * password     — чи потрібна passphrase до API-ключа.
  * balanceParams— параметри fetchBalance для ф'ючерсного рахунку.
  * openParams   — додаткові параметри ордера на відкриття (деякі біржі інакше ставлять плече x1).
+ * obLimit      — глибина стакану, яку просимо (null — як віддає біржа). За замовчуванням 50.
  * hourAligned  — біржа не віддає час виплати, але платить рівно на початку кожного інтервалу (UTC).
  */
 const META = {
@@ -31,6 +32,7 @@ const META = {
     options: { defaultType: 'swap', defaultSubType: 'linear' },
     settles: ['USDT'],
     openParams: (leverage) => ({ leverRate: leverage }),
+    obLimit: null, // HTX віддає фіксовану глибину
     keyHint: 'API Management, права Trade. Для USDT-M ф\'ючерсів.',
   },
   okx: {
@@ -56,6 +58,7 @@ const META = {
     password: true,
     balanceParams: {},
     openParams: (leverage, marginMode) => ({ leverage, marginMode }),
+    obLimit: 100, // KuCoin приймає лише 20 або 100
     keyHint: 'API Management → права Futures Trading, потрібна Passphrase.',
   },
   bingx: {
@@ -72,6 +75,7 @@ const META = {
     balanceParams: {}, // flex-рахунок
     balanceCurrencies: ['USD', 'USDT', 'USDC'],
     hourAligned: true,
+    obLimit: null,
     keyHint: 'Окремі ключі саме від Kraken FUTURES (futures.kraken.com → Settings → API Keys), не від спотового Kraken.',
   },
 };

@@ -25,6 +25,35 @@ function vwap(levels, baseAmount, contractSize = 1) {
   return cost / baseAmount;
 }
 
+/**
+ * Скільки монет можна взяти зі стакану, щоб середня ціна виконання (VWAP) відхилилась
+ * від найкращої ціни не більше ніж на maxSlip.
+ * @param {Array<[number,number]>} levels  [ціна за монету, обсяг у контрактах]
+ * @param {number} unit   монет в одному контракті
+ * @param {'buy'|'sell'} side  buy — йдемо по asks (ціна росте), sell — по bids (ціна падає)
+ */
+function maxDepth(levels, unit, maxSlip, side) {
+  if (!levels || !levels.length) return 0;
+  const best = levels[0][0];
+  const dir = side === 'buy' ? 1 : -1;
+  const limit = best * (1 + dir * maxSlip);
+  let qty = 0;
+  let cost = 0;
+  for (const [p, a] of levels) {
+    const q = a * unit;
+    if (dir * (cost + p * q) <= dir * limit * (qty + q)) {
+      qty += q;
+      cost += p * q;
+      continue;
+    }
+    // частина рівня: cost + p*x = limit*(qty + x)
+    const x = (limit * qty - cost) / (p - limit);
+    if (x > 0) qty += x;
+    break;
+  }
+  return qty;
+}
+
 class Trader {
   /**
    * @param {object} cfg
@@ -110,6 +139,88 @@ class Trader {
     return `${w.symbol}|${w.shortEx}|${w.longEx}|${w.startTs}`;
   }
 
+  /**
+   * На яку максимальну суму можна зайти в пару прямо зараз.
+   * Ліміти (у монетах): стакан на вхід на обох біржах, стакан на вихід (поточний), вільна маржа (live),
+   * ваш максимум на угоду (maxTradeUsdt) і кількість монети з /qty (якщо задана).
+   * У режимі auto додатково зменшує розмір, поки чистий профіт з урахуванням слипеджу ≥ minProfit.
+   * @returns {Promise<{base:number, mid:number, limits:Object<string,number>, limitedBy:string, books:object}|{error:string}>}
+   */
+  async estimateCapacity(win, funding = win.funding) {
+    const { symbol, shortEx, longEx } = win;
+    const S = this.ex[shortEx];
+    const L = this.ex[longEx];
+    const cfg = this.cfg;
+    const [obS, obL] = await Promise.all([S.fetchOrderBook(symbol), L.fetchOrderBook(symbol)]);
+    const bidS = obS.bids[0] && obS.bids[0][0];
+    const askL = obL.asks[0] && obL.asks[0][0];
+    if (!bidS || !askL) return { error: 'порожній стакан' };
+    const mid = (bidS + askL) / 2;
+    const uS = S.unitSize(symbol);
+    const uL = L.unitSize(symbol);
+    const slip = cfg.maxSlippagePct;
+
+    const limits = {};
+    limits[`стакан ${shortEx} (вхід)`] = maxDepth(obS.bids, uS, slip, 'sell');
+    limits[`стакан ${longEx} (вхід)`] = maxDepth(obL.asks, uL, slip, 'buy');
+    if (cfg.checkExitDepth !== false) {
+      limits[`стакан ${shortEx} (вихід)`] = maxDepth(obS.asks, uS, slip, 'buy');
+      limits[`стакан ${longEx} (вихід)`] = maxDepth(obL.bids, uL, slip, 'sell');
+    }
+    if (!this.paper) {
+      const [fS, fL] = await Promise.all([S.freeBalance(), L.freeBalance()]);
+      // залишаємо 15% маржі в запасі
+      limits[`маржа ${shortEx}`] = (fS * cfg.leverage * 0.85) / mid;
+      limits[`маржа ${longEx}`] = (fL * cfg.leverage * 0.85) / mid;
+    }
+    const coinCap = cfg.coinQty[coinOf(symbol)];
+    if (cfg.sizeMode === 'auto') {
+      limits['ваш максимум'] = cfg.maxTradeUsdt / mid;
+      if (coinCap > 0) limits[`ваш максимум ${coinOf(symbol)}`] = coinCap;
+    }
+
+    let limitedBy = '';
+    let base = Infinity;
+    for (const [k, v] of Object.entries(limits)) {
+      if (v < base) {
+        base = v;
+        limitedBy = k;
+      }
+    }
+
+    if (cfg.sizeMode === 'auto' && funding !== undefined) {
+      // Чим більше обсяг — тим гірші ціни. Шукаємо найбільший обсяг, де різниця цін ще в межах
+      // maxEntryBasisPct і чистий профіт ≥ minProfit.
+      const fees = 2 * (S.takerFee(symbol) + L.takerFee(symbol));
+      const okAt = (b) => {
+        const pS = vwap(obS.bids, b, uS);
+        const pL = vwap(obL.asks, b, uL);
+        if (!pS || !pL) return false;
+        const basis = (pS - pL) / pL;
+        return basis >= -cfg.maxEntryBasisPct && funding - fees + Math.min(basis, 0) >= cfg.minProfit;
+      };
+      if (base > 0 && !okAt(base)) {
+        let lo = 0;
+        let hi = base;
+        for (let i = 0; i < 40; i++) {
+          const m = (lo + hi) / 2;
+          if (okAt(m)) lo = m;
+          else hi = m;
+        }
+        base = lo;
+        limitedBy = 'ціна/прибутковість (чим більше обсяг, тим гірша ціна)';
+      }
+    }
+    return { base: Number.isFinite(base) ? base : 0, mid, limits, limitedBy, books: { obS, obL } };
+  }
+
+  capacityText(cap) {
+    const q = this.cfg.quote;
+    const parts = Object.entries(cap.limits).map(([k, v]) => `${k} ${fmt(v * cap.mid, 0)}`);
+    return `ліміти, ${q}: ${parts.join(' | ')}
+обмежує: ${cap.limitedBy}`;
+  }
+
   /** Вхід у вікно фандінгу (викликається за ~entryBeforeSec до першої виплати). */
   async tryOpen(win) {
     const { symbol, shortEx, longEx } = win;
@@ -137,18 +248,28 @@ class Trader {
       if (!fresh) return skip('час виплати змінився');
       if (fresh.funding < this.cfg.minFunding) return skip(`фандінг впав до ${pct(fresh.funding)}`);
 
-      // 2) Стакани, обсяг, слипедж, різниця цін
-      const [obS, obL] = await Promise.all([S.fetchOrderBook(symbol), L.fetchOrderBook(symbol)]);
-      const bidS = obS.bids[0] && obS.bids[0][0];
-      const askL = obL.asks[0] && obL.asks[0][0];
-      if (!bidS || !askL) return skip('порожній стакан');
-      const mid = (bidS + askL) / 2;
-      const sizing = this.sizePair(symbol, S, L, mid, this.targetBase(symbol, mid));
+      // 2) Стакани: на яку суму можна зайти на обох біржах, слипедж, різниця цін
+      const cap = await this.estimateCapacity(win, fresh.funding);
+      if (cap.error) return skip(cap.error);
+      const { obS, obL } = cap.books;
+      const { mid } = cap;
+      const bidS = obS.bids[0][0];
+      const askL = obL.asks[0][0];
+      const auto = this.cfg.sizeMode === 'auto';
+      const target = auto ? cap.base : this.targetBase(symbol, mid);
+      if (!auto && target > cap.base * 1.0001) {
+        return skip(`стакан/маржа не витримає ${fmt(target * mid, 0)} ${this.cfg.quote}: можна до ~${fmt(cap.base * mid, 0)} (обмежує ${cap.limitedBy})`);
+      }
+      const sizing = this.sizePair(symbol, S, L, mid, target);
       if (sizing.error) return skip(sizing.error);
+      if (sizing.base * mid < (this.cfg.minTradeUsdt || 0)) {
+        return skip(`замало ліквідності: можна лише ~${fmt(sizing.base * mid, 2)} ${this.cfg.quote} < мінімуму ${this.cfg.minTradeUsdt} (обмежує ${cap.limitedBy})`);
+      }
       const pxS = vwap(obS.bids, sizing.base, S.unitSize(symbol));
       const pxL = vwap(obL.asks, sizing.base, L.unitSize(symbol));
       if (!pxS || !pxL) return skip('не вистачає ліквідності');
-      if ((bidS - pxS) / bidS > this.cfg.maxSlippagePct || (pxL - askL) / askL > this.cfg.maxSlippagePct) return skip('слипедж більший за ліміт');
+      const tol = 1 + 1e-9;
+      if ((bidS - pxS) / bidS > this.cfg.maxSlippagePct * tol || (pxL - askL) / askL > this.cfg.maxSlippagePct * tol) return skip('слипедж більший за ліміт');
       if (this.coins) {
         const chk = this.coins.check(coinOf(symbol), shortEx, longEx, pxS, pxL);
         if (!chk.ok) return skip(`монета: ${chk.reason}`);
@@ -162,11 +283,7 @@ class Trader {
 
       const leverage = this.cfg.leverage;
       if (!this.paper) {
-        const margin = (sizing.base * mid) / leverage;
-        const [fS, fL] = await Promise.all([S.freeBalance(), L.freeBalance()]);
-        if (fS < margin * 1.2 || fL < margin * 1.2) {
-          return skip(`мало маржі (${shortEx}: ${fS.toFixed(2)}, ${longEx}: ${fL.toFixed(2)}, треба ~${(margin * 1.2).toFixed(2)})`);
-        }
+        // маржу вже враховано в estimateCapacity
         await Promise.all([
           S.prepareSymbol(symbol, leverage, this.cfg.marginMode),
           L.prepareSymbol(symbol, leverage, this.cfg.marginMode),
@@ -198,6 +315,7 @@ class Trader {
         fundingAccrued: 0,
         feesPaid: legs.fees,
         paper: this.paper,
+        capacity: { usdt: cap.base * mid, limitedBy: cap.limitedBy },
       };
       this.state.addPosition(pos);
       const notional = pos.base * mid;
@@ -206,6 +324,8 @@ class Trader {
           `${pos.endTs !== pos.startTs ? `–${clock(pos.endTs, this.cfg.timezone)}` : ''}\n` +
           `${this.orderLine('sell', shortEx, symbol, pos.base, pos.short.contracts, pos.short.entry, legs.shortFee)}\n` +
           `${this.orderLine('buy', longEx, symbol, pos.base, pos.long.contracts, pos.long.entry, legs.longFee)}\n` +
+          `Розмір: ${fmt(notional, 2)} ${this.cfg.quote} (${this.cfg.sizeMode === 'auto' ? `макс. можливий зараз ~${fmt(cap.base * mid, 0)}` : `режим ${this.cfg.sizeMode}`})\n` +
+          `${this.capacityText(cap)}\n` +
           `Виплати у вікні:\n${pos.events.map((e) => this.eventLine(e, pos.base, mid)).join('\n')}\n` +
           `Очікуваний фандінг: ${sgn(fresh.funding * 100, 4)}% ≈ ${sgn(fresh.funding * notional)} ${this.cfg.quote}\n` +
           `Різниця цін на вході: ${pct(basis)}, комісії (вхід+вихід) ≈ ${fmt(fees * notional)}\n` +
@@ -506,4 +626,4 @@ class Trader {
   }
 }
 
-module.exports = { Trader, vwap };
+module.exports = { Trader, vwap, maxDepth };

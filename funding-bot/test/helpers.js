@@ -26,6 +26,7 @@ function fakeClient({ contractSize = 1, step = 0.001, price = 100, rate = 0.0001
     },
     async fetchFundingHistory() { return this.funding; },
     async fetchOrderBook() {
+      if (this.book) return JSON.parse(JSON.stringify(this.book));
       const p = this.price;
       return { bids: [[+(p * 0.9999).toFixed(8), 1e6]], asks: [[+(p * 1.0001).toFixed(8), 1e6]] };
     },
