@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const log = require('./logger');
 const { nowParts } = require('./time');
 
 const emptyDay = () => ({ opened: 0, closed: 0, pnl: 0, funding: 0, fees: 0 });
@@ -31,12 +32,35 @@ class State {
     }
   }
 
+  /**
+   * Атомарний запис (тимчасовий файл → заміна). На Windows антивірус/індексатор/OneDrive інколи на мить
+   * блокують файл (EPERM/EBUSY) — повторюємо, а в крайньому разі пишемо напряму.
+   * Ніколи не кидає помилку: збій запису не має зірвати торгову дію (напр. постановку стопів після входу).
+   */
   save() {
     if (!this.file) return;
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    const body = JSON.stringify(this.data, null, 2);
     const tmp = `${this.file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2));
-    fs.renameSync(tmp, this.file); // атомарний запис
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      fs.writeFileSync(tmp, body);
+      for (let i = 0; ; i++) {
+        try {
+          fs.renameSync(tmp, this.file);
+          return;
+        } catch (e) {
+          if (!['EPERM', 'EBUSY', 'EACCES'].includes(e.code) || i >= 5) throw e;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (i + 1)); // коротка пауза
+        }
+      }
+    } catch (e) {
+      try {
+        fs.writeFileSync(this.file, body);
+        log.warn(`Стан збережено напряму (заміна файлу не вдалась: ${e.code || e.message})`);
+      } catch (e2) {
+        log.error(`НЕ вдалося зберегти стан у ${this.file}: ${e2.message}`);
+      }
+    }
   }
 
   get positions() {

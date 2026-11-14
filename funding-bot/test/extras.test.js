@@ -130,3 +130,27 @@ test('статистика і CSV-експорт угод', async () => {
   await tg.handle('/export 30', '42');
   assert.match(out.at(-1).text, /закритих угод немає/);
 });
+
+test('збереження стану не падає, навіть якщо файл заблоковано (Windows: антивірус, OneDrive)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-'));
+  const file = path.join(dir, 'state.json');
+  const st = new State(file);
+  st.data.stats.trades = 7;
+  const orig = fs.renameSync;
+  let calls = 0;
+  fs.renameSync = (...a) => {
+    calls += 1;
+    if (calls <= 2) { const e = new Error('busy'); e.code = 'EBUSY'; throw e; }
+    return orig(...a);
+  };
+  try {
+    st.save(); // 2 невдалі спроби, потім успіх
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).stats.trades, 7);
+    fs.renameSync = () => { const e = new Error('perm'); e.code = 'EPERM'; throw e; };
+    st.data.stats.trades = 8;
+    assert.doesNotThrow(() => st.save()); // замінити не вдалось — пише напряму
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).stats.trades, 8);
+  } finally {
+    fs.renameSync = orig;
+  }
+});

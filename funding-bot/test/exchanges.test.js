@@ -80,7 +80,8 @@ test('KeyStore: ключі з Telegram мають пріоритет над .env
   assert.equal(ks.source('okx'), '.env');
   ks.set('okx', { apiKey: 'tgkey', secret: 'y', password: 'q' });
   assert.equal(new KeyStore({}, file).get('okx').apiKey, 'tgkey');
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  // права 600 — лише Linux/macOS; у Windows доступ визначає обліковий запис (там режим завжди 666)
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   ks.remove('okx');
   assert.equal(ks.get('okx').apiKey, 'envkey');
   assert.equal(ks.source('bybit'), undefined);
