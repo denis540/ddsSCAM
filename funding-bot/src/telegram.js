@@ -86,6 +86,16 @@ const BUTTONS = {
   '🪙 Монети': '/coins',
 };
 
+/**
+ * Тексти помилок бірж містять URL запиту; деякі біржі (HTX) кладуть у нього AccessKeyId і підпис.
+ * Перед відправкою в Telegram прибираємо параметри з URL і довгі токени.
+ */
+function sanitize(text) {
+  return String(text)
+    .replace(/(https?:\/\/[^\s?"']+)\?[^\s"']*/g, '$1?…')
+    .replace(/((?:api[-_ ]?key|apikey|access[-_ ]?key(?:id)?|secret|signature|sign|passphrase|password|token)["':= ]+)[A-Za-z0-9+/=_\-]{8,}/gi, '$1***');
+}
+
 const btn = (text, data) => ({ text, callback_data: data });
 const inline = (rows) => ({ inline_keyboard: rows });
 
@@ -114,6 +124,16 @@ class Telegram {
     this.unlockedUntil = {}; // chatId -> ts: після правильного PIN 10 хв без повторного запиту
     this.pinFails = 0;
     this.pinLockedUntil = 0;
+  }
+
+  /**
+   * Хто може керувати ботом: лише користувачі, чиї id є в TELEGRAM_CHAT_ID.
+   * У групі мало, щоб збігався id чату, — інакше будь-який учасник групи керував би ботом.
+   */
+  isAuthorized(from, chat) {
+    const fromId = from && String(from.id);
+    if (fromId && this.chatIds.includes(fromId)) return true;
+    return Boolean(chat && chat.type === 'private' && this.chatIds.includes(String(chat.id)));
   }
 
   isUnlocked(chatId) {
@@ -159,7 +179,7 @@ class Telegram {
         fd.append('chat_id', id);
         fd.append('document', new Blob([content], { type: 'text/csv' }), filename);
         if (caption) fd.append('caption', caption);
-        const res = await fetch(`https://api.telegram.org/bot${this.token}/sendDocument`, { method: 'POST', body: fd });
+        const res = await fetch(`https://api.telegram.org/bot${this.token}/sendDocument`, { method: 'POST', body: fd, signal: AbortSignal.timeout(60000) });
         const json = await res.json();
         if (!json.ok) throw new Error(json.description);
       } catch (e) {
@@ -169,10 +189,13 @@ class Telegram {
   }
 
   async api(method, body) {
+    // Таймаут обов'язковий: без нього «завислий» запит зупинив би приймання команд назавжди
+    const timeoutMs = method === 'getUpdates' ? ((body && body.timeout) || 0) * 1000 + 15000 : 20000;
     const res = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const json = await res.json();
     if (!json.ok) throw new Error(`${method}: ${json.description}`);
@@ -180,7 +203,8 @@ class Telegram {
   }
 
   /** @param {object} [markup] inline-клавіатура; без неї — постійні кнопки внизу */
-  async send(text, chatId, markup) {
+  async send(rawText, chatId, markup) {
+    const text = sanitize(rawText);
     log.info(`[tg] ${text.replace(/\n/g, ' | ')}`);
     if (!this.enabled) return;
     const targets = chatId ? [String(chatId)] : this.chatIds;
@@ -239,15 +263,18 @@ class Telegram {
             const cq = u.callback_query;
             const chatId = String(cq.message && cq.message.chat.id);
             this.api('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
-            if (!this.chatIds.includes(chatId)) continue;
+            if (!this.isAuthorized(cq.from, cq.message && cq.message.chat)) {
+              log.warn(`Telegram: ігнорую кнопку від чужого користувача ${cq.from && cq.from.id} (чат ${chatId})`);
+              continue;
+            }
             this.handleCallback(cq.data, chatId).catch((e) => this.send(`❌ ${e.message}`, chatId));
             continue;
           }
           const msg = u.message;
           if (!msg || !msg.text) continue;
           const chatId = String(msg.chat.id);
-          if (!this.chatIds.includes(chatId)) {
-            log.warn(`Telegram: ігнорую повідомлення з чужого чату ${chatId}`);
+          if (!this.isAuthorized(msg.from, msg.chat)) {
+            log.warn(`Telegram: ігнорую повідомлення від ${msg.from && msg.from.id} з чату ${chatId}`);
             continue;
           }
           this.handle(msg.text.trim(), chatId, msg.message_id).catch((e) => this.send(`❌ ${e.message}`, chatId));
@@ -666,6 +693,13 @@ class Telegram {
         if (!all[id]) return reply(`Біржа "${args[0] || ''}" не увімкнена. Доступні: ${Object.keys(all).join(', ')}`);
         if (args.length < 3) return reply(`Формат: /setkey ${id} <apiKey> <secret>${meta && meta.password ? ' <passphrase>' : ''}`);
         if (meta && meta.password && !args[3]) return reply(`${meta.title} потребує passphrase: /setkey ${id} <apiKey> <secret> <passphrase>`);
+        const open = state.positions.filter((p) => p.shortEx === id || p.longEx === id);
+        if (open.length) {
+          return reply(
+            `⛔ На ${META[id] ? META[id].title : id} відкриті позиції бота (${open.map((p) => p.symbol.split('/')[0]).join(', ')}). ` +
+              'Новий ключ (можливо, іншого акаунта) зламав би їх супровід. Дочекайтесь закриття або закрийте їх, потім змініть ключ.'
+          );
+        }
         const creds = { apiKey: args[1], secret: args[2], password: args[3] };
         const ex = all[id];
         const prev = keys.get(id);
@@ -677,7 +711,9 @@ class Telegram {
           keys.set(id, creds);
           if (coins) coins.load(ex).catch(() => {}); // з ключем біржа може віддати адреси контрактів
           if (this.ctx.checkPositionMode) await this.ctx.checkPositionMode(ex);
-          return reply(`✅ Ключ ${ex.title} ${mask(creds.apiKey)} збережено і перевірено. Баланс: ${b.free.toFixed(2)} ${b.currency}\n(повідомлення з ключем видалено з чату)`);
+          await reply(`✅ Ключ ${ex.title} ${mask(creds.apiKey)} збережено і перевірено. Баланс: ${b.free.toFixed(2)} ${b.currency}\n(повідомлення з ключем видалено з чату)`);
+          if (this.ctx.onKeyAdded) await this.ctx.onKeyAdded(ex); // самоперевірка перед торгівлею
+          return undefined;
         } catch (e) {
           ex.setCredentials(prev);
           return reply(`❌ Ключ ${ex.title} не працює: ${e.message.slice(0, 200)}\nПідказка: ${(meta && meta.keyHint) || ''}`);
@@ -687,6 +723,8 @@ class Telegram {
         const id = normalizeName(args[0]);
         const { all, keys } = this.ctx;
         if (!all[id]) return reply('Формат: /delkey <біржа>');
+        const openPos = state.positions.filter((p) => p.shortEx === id || p.longEx === id);
+        if (openPos.length) return reply(`⛔ На ${all[id].title} відкриті позиції бота (${openPos.map((p) => p.symbol.split('/')[0]).join(', ')}) — без ключа бот не зможе їх закрити. Спершу закрийте позиції.`);
         keys.remove(id);
         all[id].setCredentials(keys.get(id)); // повертаємось до ключа з .env, якщо він є
         return reply(`🗑 Ключ ${all[id].title}, доданий через Telegram, видалено.${keys.source(id) ? ' Діє ключ з .env.' : ''}`);
@@ -842,4 +880,4 @@ ${lines.length ? lines.join('\n') : '✅ Позиції бота збігают�
   }
 }
 
-module.exports = { Telegram, COMMANDS, HELP };
+module.exports = { Telegram, COMMANDS, HELP, sanitize };

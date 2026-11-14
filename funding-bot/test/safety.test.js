@@ -85,6 +85,9 @@ test('спрацював стоп / ліквідація на одній бір�
   a.client.pos[SYM] = 0; // біржа a закрила шорт (стоп)
   at(10000);
   await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'одна порожня відповідь API — ще не привід закривати');
+  at(15000);
+  await trader.manage(await rates());
   assert.equal(state.positions.length, 0);
   const last = b.client.orders.at(-1);
   assert.equal(last.side, 'sell');
@@ -101,6 +104,8 @@ test('спрацював стоп / ліквідація на одній бір�
   s2.a.client.has.fetchMyTrades = true;
   s2.a.client.fetchMyTrades = async () => [{ side: 'buy', price: 104, amount: 0.5, timestamp: Date.now() + 5000 }];
   s2.at(10000);
+  await s2.trader.manage(await s2.rates());
+  s2.at(15000);
   await s2.trader.manage(await s2.rates());
   assert.match(s2.msgs.find((m) => m.includes('ВИХІД')), /ціна 104 \(факт з біржі\)/);
 });

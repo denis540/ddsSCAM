@@ -54,6 +54,7 @@ async function main() {
   // Лише одна копія бота: дві торгували б одним рахунком
   if (!scanOnly) acquireLock(cfg.lockFile);
   const state = new State(cfg.stateFile, cfg.timezone);
+  state.pendingNotes = [];
   const settings = new Settings(cfg, cfg.settingsFile);
   const tg = new Telegram(cfg.telegram);
   const notify = (t, markup) => tg.send(t, undefined, markup);
@@ -95,6 +96,29 @@ async function main() {
 
   let lastInitTry = 0;
   let trader; // створюється нижче; initPending викликається і до, і після
+
+  const applySelfTest = (ex, r) => {
+    const failed = r.checks.filter((c) => !c.ok && c.critical !== false).map((c) => `${c.name}: ${c.info}`);
+    if (failed.length) ex.tradeBlocked = `самоперевірка не пройдена — ${failed.join('; ')}`;
+    else if (ex.tradeBlocked && ex.tradeBlocked.startsWith('самоперевірка')) ex.tradeBlocked = undefined;
+  };
+  /**
+   * Live, біржа з ключем: фактичні комісії + самоперевірка. Викликається при старті, коли біржа
+   * підключилась пізніше, і після додавання ключа через Telegram — щоб жодна біржа не торгувала без перевірки.
+   */
+  const prepareKeyedExchange = async (ex, { quiet = false } = {}) => {
+    if (cfg.mode !== 'live' || !ex.hasKeys || !ex.ready) return;
+    await ex.loadAccountFees().catch((e) => log.debug(`${ex.id} fees: ${e.message}`));
+    if (!cfg.selfTestOnStart) return;
+    const avoid = state.positions.filter((p) => p.shortEx === ex.id || p.longEx === ex.id).map((p) => p.symbol);
+    const r = await ex.runSelfTest({ avoid }).catch((e) => ({ ok: false, checks: [{ name: 'самоперевірка', ok: false, critical: true, info: e.message }] }));
+    applySelfTest(ex, r);
+    if (!r.ok) {
+      const msg = `⛔ ${ex.title}: самоперевірка не пройдена — бот не торгує на цій біржі\n${r.checks.filter((c) => !c.ok).map((c) => `   ✗ ${c.name}: ${c.info}`).join('\n')}`;
+      if (quiet) state.pendingNotes.push(msg); // надішлемо після старту Telegram
+      else await notify(msg);
+    }
+  };
   const blockedNotified = new Set();
   /** Live: біржа має бути в one-way режимі позицій, інакше торгівлю на ній блокуємо. */
   const checkPositionMode = async (ex) => {
@@ -117,7 +141,11 @@ async function main() {
             exchanges[ex.id] = ex;
             delete initErrors[ex.id];
             await checkPositionMode(ex);
-            if (trader && trader.coins) trader.coins.load(ex).catch(() => {});
+            if (trader) {
+              // біржа підключилась уже після старту — теж перевіряємо перед торгівлею
+              await prepareKeyedExchange(ex);
+              if (trader.coins) trader.coins.load(ex).catch(() => {});
+            }
           } catch (e) {
             initErrors[ex.id] = e.message;
             log.error(`${ex.title}: підключення не вдалося: ${e.message}`);
@@ -158,25 +186,12 @@ async function main() {
   };
   await syncClock();
 
-  // ---- Live: фактичні комісії акаунта і самоперевірка кожної біржі з ключем ----
-  const applySelfTest = (ex, r) => {
-    const failed = r.checks.filter((c) => !c.ok && c.critical !== false).map((c) => `${c.name}: ${c.info}`);
-    if (failed.length) ex.tradeBlocked = `самоперевірка не пройдена — ${failed.join('; ')}`;
-    else if (ex.tradeBlocked && ex.tradeBlocked.startsWith('самоперевірка')) ex.tradeBlocked = undefined;
-  };
+  // ---- Live: фактичні комісії акаунта і самоперевірка кожної біржі з ключем (і тих, що підключаться пізніше) ----
+  state.pendingNotes = [];
   if (cfg.mode === 'live' && !scanOnly) {
     const keyed = Object.values(exchanges).filter((e) => e.hasKeys);
-    await Promise.all(keyed.map((ex) => ex.loadAccountFees().catch((e) => log.debug(`${ex.id} fees: ${e.message}`))));
-    if (cfg.selfTestOnStart && keyed.length) {
-      const res = await Promise.all(keyed.map(async (ex) => [ex, await ex.runSelfTest().catch((e) => ({ ok: false, checks: [{ name: 'самоперевірка', ok: false, critical: true, info: e.message }] }))]));
-      for (const [ex, r] of res) applySelfTest(ex, r);
-      const bad = res.filter(([, r]) => !r.ok);
-      log.info(`Самоперевірка: ${res.map(([ex, r]) => `${ex.id} ${r.ok ? 'ok' : 'FAIL'}`).join(', ')}`);
-      if (bad.length) {
-        // повідомлення надішлемо після старту Telegram
-        state.pendingNotes = bad.map(([ex, r]) => `⛔ ${ex.title}: самоперевірка не пройдена — бот не торгує на цій біржі\n${r.checks.filter((c) => !c.ok).map((c) => `   ✗ ${c.name}: ${c.info}`).join('\n')}`);
-      }
-    }
+    await Promise.all(keyed.map((ex) => prepareKeyedExchange(ex, { quiet: true })));
+    log.info(`Самоперевірка: ${keyed.map((ex) => `${ex.id} ${ex.selfTest ? (ex.selfTest.ok ? 'ok' : 'FAIL') : '—'}`).join(', ')}`);
   }
 
   // ---- Перевірка монет: адреси контрактів + ризики ринку + обсяги ----
@@ -223,7 +238,7 @@ async function main() {
   if (!scanOnly) {
     await tg.start({
       cfg, settings, state, trader, keys, all, exchanges, initErrors, coins, guard, reconciler, marketProblem,
-      checkPositionMode, applySelfTest,
+      checkPositionMode, applySelfTest, onKeyAdded: (ex) => prepareKeyedExchange(ex),
       runBacktest: (days) => runBacktest({ exchanges, cfg, days, maxCoins: 25 }),
       getRates: () => lastRates,
       getOpps: () => lastWindows,
@@ -381,15 +396,46 @@ async function main() {
     await tg.send(formatDailyReport(cfg, state, day, lastRates));
   };
 
-  let nextScan = 0;
+  // Збій посеред відкриття — звірка якнайшвидше (закриє непарні ноги)
+  trader.onCrashDuringOpen = () => {
+    reconciledAt = 0;
+  };
+
+  // Сканування (ставки всіх бірж, тікери, статуси) — у фоні: повільна біржа чи помилка тут
+  // не повинні затримувати нагляд за відкритими позиціями (ризик ліквідації кожні 5 с).
+  let scanning = false;
+  const runScan = () => {
+    if (scanning) return;
+    scanning = true;
+    scan()
+      .catch((e) => log.error('Помилка сканування:', e.message))
+      .finally(() => {
+        scanning = false;
+      });
+  };
+  try {
+    await scan(); // перші дані — до старту торгового циклу
+  } catch (e) {
+    log.error('Помилка сканування:', e.message);
+  }
+
+  let nextScan = Date.now() + cfg.scanIntervalSec * 1000;
   while (!stopping) {
     const started = Date.now();
-    try {
-      if (started >= nextScan) {
-        nextScan = started + cfg.scanIntervalSec * 1000;
-        await scan();
+    if (started >= nextScan) {
+      nextScan = started + cfg.scanIntervalSec * 1000;
+      if (scanOnly) {
+        try {
+          await scan();
+        } catch (e) {
+          log.error('Помилка сканування:', e.message);
+        }
+      } else {
+        runScan();
       }
-      if (!scanOnly) {
+    }
+    if (!scanOnly) {
+      try {
         await trader.withLock(async () => {
           await trader.manage(lastRates);
           if (!cfg.paused) {
@@ -401,12 +447,16 @@ async function main() {
             }
           }
         });
+      } catch (e) {
+        log.error('Помилка торгового циклу:', e.message);
+      }
+      try {
         if (cfg.mode === 'live' && Date.now() - reconciledAt > cfg.reconcileMin * MIN) await reconcile();
         await maybeDailyReport();
         await heartbeat();
+      } catch (e) {
+        log.error('Помилка службових задач:', e.message);
       }
-    } catch (e) {
-      log.error('Помилка циклу:', e.message);
     }
     const wait = (scanOnly ? cfg.scanIntervalSec : cfg.tickSec) * 1000 - (Date.now() - started);
     for (let t = 0; t < wait && !stopping; t += 250) await sleep(Math.min(250, wait - t));

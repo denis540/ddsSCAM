@@ -6,6 +6,9 @@ const { metaOf, normalizeName } = require('./exchanges-meta');
 
 const HOUR = 3600 * 1000;
 
+/** Відповіді бірж «вже так налаштовано» (не помилка). Вузько, щоб не прийняти справжню помилку за успіх. */
+const BENIGN = /not modified|no need to change|no changes? (needed|made)|unchanged|already (set|is|in|been)|same as (the )?(current|existing|previous)|leverage not changed|margin mode is the same|position mode is the same/i;
+
 function parseIntervalHours(fr, cachedIntervals) {
   // 1) ccxt уніфіковане поле interval: '8h' | '4h' | '1h'
   if (typeof fr.interval === 'string') {
@@ -324,7 +327,19 @@ class Exchange {
 
   /** Кількість монет -> кількість контрактів (з округленням вниз до кроку біржі). */
   baseToContracts(symbol, baseAmount) {
-    return Number(this.client.amountToPrecision(this.n(symbol), baseAmount / this.unitSize(symbol)));
+    if (!(baseAmount > 0)) return 0;
+    try {
+      return Number(this.client.amountToPrecision(this.n(symbol), baseAmount / this.unitSize(symbol)));
+    } catch (e) {
+      return 0; // ccxt кидає помилку, якщо кількість менша за крок лота
+    }
+  }
+
+  /** Крок кількості в КОНТРАКТАХ (менший залишок біржа не прийме). */
+  contractStep(symbol) {
+    const p = (this.market(symbol).precision || {}).amount;
+    if (!(p > 0)) return 0;
+    return this.client.precisionMode === ccxt.DECIMAL_PLACES ? 10 ** -p : p;
   }
 
   contractsToBase(symbol, contracts) {
@@ -349,7 +364,7 @@ class Exchange {
     if (this.leverageSet.has(key)) return;
     this.lastLeverage = leverage;
     this.lastMarginMode = marginMode;
-    const benign = (e) => e instanceof ccxt.NoChange || e instanceof ccxt.MarginModeAlreadySet || /not modified|no change|same|already|unchanged|no need/i.test(e.message);
+    const benign = (e) => e instanceof ccxt.NoChange || e instanceof ccxt.MarginModeAlreadySet || BENIGN.test(e.message);
     if (this.client.has.setMarginMode && marginMode) {
       try {
         await this.client.setMarginMode(marginMode, s, { leverage });
@@ -394,26 +409,43 @@ class Exchange {
       .map((p) => ({ ...p, canonical: this.fromNative[p.symbol] || p.symbol }));
   }
 
+  /**
+   * Дочекатися фінального стану ордера. Деякі біржі одразу відповідають «прийнято» з filled=0,
+   * хоча ордер виконується за мить — тоді питаємо ще раз (до 3 разів).
+   */
+  async settleOrder(order, s) {
+    let o = order;
+    const final = (x) => ['closed', 'canceled', 'cancelled', 'expired', 'rejected'].includes(String(x.status || '').toLowerCase());
+    for (let i = 0; i < 3; i++) {
+      const known = Number.isFinite(o.filled) && (!(o.filled > 0) || o.average || o.price);
+      if ((final(o) && known) || !this.client.has.fetchOrder || !o.id) break;
+      if (known && o.status === undefined) break; // біржа не віддає статус, але кількість відома
+      await new Promise((r) => setTimeout(r, 250 * (i + 1)));
+      try {
+        o = { ...o, ...(await this.client.fetchOrder(o.id, s)) };
+      } catch (e) {
+        log.debug(`${this.id} fetchOrder: ${e.message}`);
+        break;
+      }
+    }
+    return o;
+  }
+
   /** Ринковий ордер. side: 'buy' | 'sell'. amount у контрактах. */
   async marketOrder(symbol, side, contracts, { reduceOnly = false, leverage, marginMode } = {}) {
     const s = this.n(symbol);
     const params = reduceOnly ? { reduceOnly: true } : {};
     const lev = leverage || this.lastLeverage;
     if (this.meta.openParams && lev) Object.assign(params, this.meta.openParams(lev, marginMode || this.lastMarginMode));
-    const order = await this.client.createOrder(s, 'market', side, contracts, undefined, params);
-    // Деякі біржі не повертають filled/average одразу — дотягуємо
-    let o = order;
-    if ((!Number.isFinite(o.filled) || !o.average) && this.client.has.fetchOrder && o.id) {
-      try {
-        o = await this.client.fetchOrder(o.id, s);
-      } catch (e) {
-        log.debug(`${this.id} fetchOrder: ${e.message}`);
-      }
-    }
+    const o = await this.settleOrder(await this.client.createOrder(s, 'market', side, contracts, undefined, params), s);
     const settle = this.settleOf(symbol);
+    const st = String(o.status || '').toLowerCase();
+    // Скасований/відхилений ринковий ордер — виконано лише те, що біржа показала (а не «все»).
+    // Невідомо — вважаємо виконаним повністю; трейдер потім звіряє з фактичною позицією на біржі.
+    const filled = Number.isFinite(o.filled) && o.filled > 0 ? o.filled : ['canceled', 'cancelled', 'expired', 'rejected'].includes(st) ? 0 : contracts;
     return {
       id: o.id,
-      filled: Number.isFinite(o.filled) && o.filled > 0 ? o.filled : contracts,
+      filled,
       average: (o.average || o.price) ? (o.average || o.price) / (this.mult[symbol] || 1) : undefined,
       fee: o.fee && [settle, this.quote].includes(o.fee.currency) ? o.fee.cost : undefined,
     };
@@ -436,15 +468,7 @@ class Exchange {
     const lev = leverage || this.lastLeverage;
     if (this.meta.openParams && lev) Object.assign(params, this.meta.openParams(lev, marginMode || this.lastMarginMode));
     const price = this.nativePrice(symbol, priceCap);
-    const order = await this.client.createOrder(s, 'limit', side, contracts, price, params);
-    let o = order;
-    if ((!Number.isFinite(o.filled) || (o.filled > 0 && !o.average)) && this.client.has.fetchOrder && o.id) {
-      try {
-        o = await this.client.fetchOrder(o.id, s);
-      } catch (e) {
-        log.debug(`${this.id} fetchOrder: ${e.message}`);
-      }
-    }
+    const o = await this.settleOrder(await this.client.createOrder(s, 'limit', side, contracts, price, params), s);
     const settle = this.settleOf(symbol);
     const filled = Number.isFinite(o.filled) ? o.filled : 0;
     return {
@@ -508,7 +532,7 @@ class Exchange {
         try {
           await this.client.setPositionMode(false);
         } catch (e) {
-          if (!/not modified|no need|same|already|unchanged/i.test(e.message)) throw e;
+          if (!(e instanceof ccxt.NoChange) && !BENIGN.test(e.message)) throw e;
         }
         return undefined;
       }

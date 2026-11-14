@@ -78,12 +78,17 @@ test('telegram: повідомлення з чужого чату ігнорую
     if (method !== 'getUpdates') return {};
     if (++calls > 1) { tg.stopped = true; return []; }
     return [
-      { update_id: 1, message: { chat: { id: 666 }, text: '/closeall yes' } },
-      { update_id: 2, message: { chat: { id: 42 }, text: '/status' } },
+      { update_id: 1, message: { chat: { id: 666, type: 'private' }, from: { id: 666 }, text: '/closeall yes' } },
+      { update_id: 2, message: { chat: { id: 42, type: 'private' }, from: { id: 42 }, text: '/status' } },
+      // група з id з налаштувань, але пише сторонній учасник — ігноруємо
+      { update_id: 3, message: { chat: { id: -100500, type: 'supergroup' }, from: { id: 777 }, text: '/closeall yes' } },
+      // та сама група, пише власник (його id у TELEGRAM_CHAT_ID) — приймаємо
+      { update_id: 4, message: { chat: { id: -100500, type: 'supergroup' }, from: { id: 42 }, text: '/positions' } },
     ];
   };
+  tg.chatIds.push('-100500');
   await tg.poll();
-  assert.deepEqual(handled, [['/status', '42']]);
+  assert.deepEqual(handled, [['/status', '42'], ['/positions', '-100500']]);
 });
 
 test('telegram: /setkey перевіряє ключ, зберігає, видаляє повідомлення; /delkey', async () => {
@@ -127,4 +132,15 @@ test('telegram: /setkey перевіряє ключ, зберігає, вида�
   assert.match(sent.at(-1), /OKX: вільно 77.00/);
   await tg.handle('/delkey okx', '42');
   assert.ok(!okx.hasKeys);
+});
+
+test('settings: суперечливі налаштування відхиляються', () => {
+  const cfg = { stopAtPct: 0.8, liqClosePct: 0.6, entryBeforeSec: 120, entryMinSec: 20 };
+  const st = new Settings(cfg, null);
+  assert.throws(() => st.set('stopat', '50'), /має бути ДАЛІ/);
+  assert.throws(() => st.set('liqclose', '85'), /має бути ДАЛІ/);
+  assert.throws(() => st.set('entrymin', '150'), /менше за «вхід до виплати»/);
+  assert.equal(cfg.stopAtPct, 0.8);
+  st.set('stopat', '90');
+  assert.equal(cfg.stopAtPct, 0.9);
 });

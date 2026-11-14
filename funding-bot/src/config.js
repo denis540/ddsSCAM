@@ -139,6 +139,12 @@ const config = {
   },
 };
 
+{
+  const { consistencyError } = require('./settings');
+  const problem = consistencyError(config);
+  if (problem) throw new Error(problem);
+}
+
 if (!['auto', 'coins', 'usdt'].includes(config.sizeMode)) throw new Error('SIZE_MODE має бути auto, coins або usdt');
 
 module.exports = config;

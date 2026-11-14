@@ -94,6 +94,17 @@ function display(def, v) {
   return String(v);
 }
 
+/** Налаштування, що суперечать одне одному. @returns {string|undefined} опис проблеми */
+function consistencyError(c) {
+  if (c.stopAtPct !== undefined && c.liqClosePct !== undefined && c.stopAtPct <= c.liqClosePct) {
+    return `стоп на біржі (${Math.round(c.stopAtPct * 100)}% шляху) має бути ДАЛІ, ніж бот сам закриває пару (${Math.round(c.liqClosePct * 100)}%) — інакше біржа завжди закриватиме ногу раніше за бота`;
+  }
+  if (c.entryMinSec !== undefined && c.entryBeforeSec !== undefined && c.entryMinSec >= c.entryBeforeSec) {
+    return `«найпізніший вхід» (${c.entryMinSec} с) має бути менше за «вхід до виплати» (${c.entryBeforeSec} с) — інакше бот не зайде в жодну угоду`;
+  }
+  return undefined;
+}
+
 class Settings {
   constructor(cfg, file) {
     this.cfg = cfg;
@@ -131,6 +142,8 @@ class Settings {
     const def = SCHEMA[String(key).toLowerCase()];
     if (!def) throw new Error(`невідомий параметр "${key}". Список: /settings`);
     const v = parse(def, raw);
+    const problem = consistencyError({ ...this.cfg, [def.field]: v });
+    if (problem) throw new Error(problem);
     this.cfg[def.field] = v;
     this.overrides[key.toLowerCase()] = raw;
     this.save();
@@ -159,4 +172,4 @@ class Settings {
   }
 }
 
-module.exports = { Settings, SCHEMA, display };
+module.exports = { Settings, SCHEMA, display, consistencyError };

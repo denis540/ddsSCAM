@@ -15,7 +15,6 @@ const baseCfg = {
   exitAfterSec: 120, settleDelaySec: 10, convergePct: 0.0005, earlyExit: true, liqBufferPct: 0.15,
   whitelist: [], blacklist: [], defaultTakerFee: 0.0005,
 };
-const quiet = async () => {};
 
 /** a = "OKX" (ставка 3%), b = "Binance" (1%, контракт 0.1). Виплата на обох через 100 с. */
 async function setup(cfgOver = {}, aOpts = {}, bOpts = {}) {

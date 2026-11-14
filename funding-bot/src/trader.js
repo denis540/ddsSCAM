@@ -374,6 +374,12 @@ class Trader {
           return skip(e.message);
         }
       }
+      if (!this.paper) {
+        // В one-way режимі позиції по монеті сумуються: якщо на біржі вже є позиція (ручна чи чужа),
+        // наша угода змішалась би з нею. Такий вхід пропускаємо.
+        const pre = await Promise.all([S.fetchPosition(symbol), L.fetchPosition(symbol)]);
+        if (pre[0] || pre[1]) return skip(`на ${pre[0] ? shortEx : longEx} вже є позиція по ${coinOf(symbol)} (не від цієї угоди)`);
+      }
       if (this.now() > win.startTs - this.cfg.entryMinSec * 1000) return skip('не встигли до виплати');
 
       // 3) Відкриття обох ніг. Намір записуємо ДО ордерів: якщо бот впаде посередині,
@@ -384,9 +390,15 @@ class Trader {
       let legs;
       try {
         legs = await this.executeOpen(symbol, S, L, sizing, pxS, pxL, leverage, caps);
-      } finally {
-        this.state.clearPending(symbol);
+      } catch (e) {
+        // Намір НЕ стираємо: звірка з біржами знайде й закриє ноги, що встигли відкритись
+        this.skipped.set(key, win.startTs);
+        await this.notify(`🚨 ${symbol}: збій посеред відкриття (${e.message}). Звірка з біржами перевірить і закриє непарні ноги.`);
+        await this.reportError(`${symbol}: збій посеред відкриття`);
+        if (this.onCrashDuringOpen) this.onCrashDuringOpen();
+        return false;
       }
+      this.state.clearPending(symbol);
       if (!legs) return skip('не вдалося відкрити');
 
       const openedAt = this.now();
@@ -468,6 +480,8 @@ class Trader {
     if (rs.status === 'fulfilled' && rl.status === 'fulfilled') {
       const short = rs.value;
       const long = rl.value;
+      // Правда — фактична позиція на біржі, а не відповідь на ордер (деякі біржі звітують із запізненням)
+      await this.syncFilledWithPositions(symbol, [[S, short, 'short'], [L, long, 'long']]);
       short.average = short.average || pxS;
       long.average = long.average || pxL;
       const shortFee = short.fee ?? S.contractsToBase(symbol, short.filled) * short.average * S.takerFee(symbol);
@@ -481,6 +495,10 @@ class Trader {
       return { base, short, long, shortFee, longFee, fees: shortFee + longFee, shortType: short.type, longType: long.type };
     }
     // Одна нога не відкрилась — відкатуємо іншу (терміново, ринком)
+    await this.syncFilledWithPositions(
+      symbol,
+      [[S, rs, 'short'], [L, rl, 'long']].filter(([, r]) => r.status === 'fulfilled').map(([ex, r, k]) => [ex, r.value, k])
+    );
     const failed = [];
     if (rs.status === 'rejected') failed.push(`SHORT ${S.id}: ${rs.reason && rs.reason.message}`);
     if (rl.status === 'rejected') failed.push(`LONG ${L.id}: ${rl.reason && rl.reason.message}`);
@@ -493,6 +511,28 @@ class Trader {
     await this.notify(`⚠️ ${symbol}: не вдалося відкрити пару, відкат.\n${failed.join('\n')}${rollback.length ? `\nВідкат:\n${rollback.join('\n')}` : ''}`);
     await this.reportError(`не вдалося відкрити ${symbol}: ${failed.join('; ')}`);
     return undefined;
+  }
+
+  /**
+   * Звіряє виконану кількість з фактичною позицією на біржі (перед входом позиції по монеті не було,
+   * тож позиція = виконане). Якщо біржа не відповіла — лишаємо дані з відповіді на ордер.
+   */
+  async syncFilledWithPositions(symbol, legs) {
+    await new Promise((r) => setTimeout(r, this.positionSyncDelayMs ?? 300));
+    await Promise.all(
+      legs.map(async ([ex, order, side]) => {
+        try {
+          const p = await ex.fetchPosition(symbol);
+          const actual = p && (!p.side || p.side === side) ? Math.abs(p.contracts) : 0;
+          if (Math.abs(actual - (order.filled || 0)) > 1e-12) {
+            log.warn(`${ex.id} ${symbol}: ордер звітував ${order.filled}, фактична позиція ${actual} — беру фактичну`);
+            order.filled = actual;
+          }
+        } catch (e) {
+          log.debug(`${ex.id} fetchPosition ${symbol}: ${e.message}`);
+        }
+      })
+    );
   }
 
   /**
@@ -533,7 +573,8 @@ class Trader {
    * Закриття ноги (reduceOnly) з повторами, доки не закриється вся кількість.
    * Звичайне закриття: до 2 спроб лімітним IOC з межею ціни за свіжим стаканом, далі — ринком
    * (вийти треба гарантовано). Термінове (urgent): одразу ринком.
-   * @returns {Promise<{filled:number, average:number, fee:number|undefined, type:string}|undefined>}
+   * Якщо позиції на біржі вже немає (спрацював стоп, ліквідація) — повертає externallyClosed.
+   * @returns {Promise<{filled:number, average:number|undefined, fee:number|undefined, type:string, externallyClosed?:boolean}|undefined>}
    */
   async closeLegWithRetry(exchange, symbol, side, contracts, opts = {}, attempts = 5) {
     let left = contracts;
@@ -542,7 +583,10 @@ class Trader {
     let fee;
     const types = new Set();
     let limitTries = opts.urgent ? 0 : 2;
-    for (let i = 1; i <= attempts + limitTries && left > 0; i++) {
+    const total = attempts + limitTries;
+    const minLeft = exchange.contractStep ? exchange.contractStep(symbol) * 0.5 : 0;
+    let lastErr;
+    for (let i = 1; i <= total && left > minLeft; i++) {
       try {
         let cap;
         if (limitTries > 0) {
@@ -556,14 +600,33 @@ class Trader {
         cost += f * (o.average || 0);
         if (o.fee !== undefined) fee = (fee || 0) + o.fee;
         left = Number((left - f).toPrecision(12));
-        if (left > 0 && f > 0) log.warn(`${exchange.id} ${symbol}: закрито частково, лишилось ${left} контр. — дозакриваю`);
+        if (left > minLeft && f > 0) log.warn(`${exchange.id} ${symbol}: закрито частково, лишилось ${left} контр. — дозакриваю`);
       } catch (e) {
-        log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}: ${e.message}`);
-        await sleep(500 * 2 ** Math.min(i, 4));
+        lastErr = e;
+        log.error(`${exchange.id} ${symbol}: закриття ноги, спроба ${i}/${total}: ${e.message}`);
+        if (i < total) await sleep(500 * 2 ** Math.min(i, 3));
       }
     }
-    if (left > 0) {
-      await this.notify(`🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ${filled > 0 ? `залишок ${left} контр. ` : ''}ноги на ${exchange.id}! Бот повторить спробу, перевірте біржу.`);
+    if (left > minLeft) {
+      // Можливо, позиції вже немає (біржа закрила стопом/ліквідацією) — тоді reduceOnly і не пройде
+      try {
+        const p = await exchange.fetchPosition(symbol);
+        if (!p) {
+          log.warn(`${exchange.id} ${symbol}: позиції на біржі вже немає — нога закрита біржею`);
+          return { filled: contracts, average: filled > 0 ? cost / filled : undefined, fee, type: [...types][0], externallyClosed: filled < contracts };
+        }
+      } catch (e) {
+        log.debug(`${exchange.id} fetchPosition: ${e.message}`);
+      }
+      const key = `${exchange.id}|${symbol}`;
+      this.closeFailAt = this.closeFailAt || {};
+      if (!this.closeFailAt[key] || this.now() - this.closeFailAt[key] > 5 * 60000) {
+        this.closeFailAt[key] = this.now();
+        await this.notify(
+          `🚨 ${symbol}: НЕ ВДАЛОСЯ ЗАКРИТИ ${filled > 0 ? `залишок ${left} контр. ` : ''}ноги на ${exchange.id}` +
+            `${lastErr ? ` (${lastErr.message.slice(0, 150)})` : ''}. Бот повторює спроби; перевірте біржу.`
+        );
+      }
       await this.reportError(`${symbol}: не вдалося закрити ногу на ${exchange.id}`);
       return undefined;
     }
@@ -597,7 +660,9 @@ class Trader {
           } catch (e) {
             log.debug(`${exId} fetchPosition: ${e.message}`);
           }
-          leg.liq = liq || this.estimateLiq(pos, legKey);
+          // ціна ліквідації має бути «по той бік» від входу (шорт — вище, лонг — нижче); інакше — оцінка
+          const valid = liq > 0 && (legKey === 'short' ? liq > leg.entry : liq < leg.entry);
+          leg.liq = valid ? liq : this.estimateLiq(pos, legKey);
           const stop = leg.entry + (leg.liq - leg.entry) * this.cfg.stopAtPct;
           const o = await ex.placeStop(pos.symbol, side, leg.contracts, stop);
           leg.stopId = o.id;
@@ -755,7 +820,8 @@ class Trader {
     for (const pos of [...this.state.positions]) {
       try {
         if (pos.closeError) {
-          await this.closePair(pos, `повторна спроба закриття (${pos.closeError})`, undefined, { urgent: true });
+          // Повтор закриття: швидкий (2 спроби), щоб не блокувати нагляд за іншими позиціями
+          await this.closePair(pos, `повторна спроба закриття (${pos.closeError})`, undefined, { urgent: true, retry: true });
           continue;
         }
         // Ризик ліквідації — першим, кожні liqCheckSec (за замовчуванням 5 с)
@@ -864,12 +930,25 @@ class Trader {
         try {
           const p = await ex.fetchPosition(pos.symbol);
           if (!p) {
-            pos.missingChecks = (pos.missingChecks || 0) + 1;
+            // Одна порожня відповідь API ще не означає, що позиції немає — потрібні 2 перевірки поспіль
+            leg.missingChecks = (leg.missingChecks || 0) + 1;
+            if (leg.missingChecks < 2) return undefined;
             return { reason: `позиція ${legKey.toUpperCase()} на ${exId} зникла (спрацював стоп / ліквідація / ADL / ручне закриття) — закриваю другу ногу`, missing: [legKey] };
+          }
+          leg.missingChecks = 0;
+          const actual = Math.abs(p.contracts || 0);
+          if (Math.abs(actual - leg.contracts) > Math.max(leg.contracts * 1e-6, (ex.contractStep(pos.symbol) || 0) * 0.5)) {
+            // Біржа частково зменшила ногу (ADL / часткова ліквідація) — хедж порушено, закриваємо пару
+            const was = leg.contracts;
+            leg.contracts = actual;
+            return { reason: `${legKey.toUpperCase()} ${exId}: розмір ноги змінила біржа (${was} → ${actual} контр., ADL/часткова ліквідація) — хедж порушено` };
           }
           const mult = ex.mult[pos.symbol] || 1;
           const mark = p.markPrice ? p.markPrice / mult : undefined;
-          if (p.liquidationPrice > 0) leg.liq = p.liquidationPrice / mult;
+          if (p.liquidationPrice > 0) {
+            const liq = p.liquidationPrice / mult;
+            if (legKey === 'short' ? liq > leg.entry : liq < leg.entry) leg.liq = liq;
+          }
           const pr = progress(legKey, mark, leg.liq || this.estimateLiq(pos, legKey));
           if (pr >= limit) return { reason: `${legKey.toUpperCase()} ${exId}: ціна пройшла ${pct(pr, 0)} шляху до ліквідації` };
         } catch (e) {
@@ -913,45 +992,26 @@ class Trader {
       } else {
         if (!quote && !opt.missing) quote = await this.exitQuote(pos).catch(() => undefined); // для статистики проковзування
         // Нога, якої вже немає на біржі (стоп/ліквідація/вручну), не закривається.
-        // Ціна її закриття: факт з історії угод біржі → поточна ціна стакану → ціна стопу.
         for (const legKey of opt.missing || []) {
           const leg = pos[legKey];
           if (!(leg.contracts > 0)) continue;
-          const ex = legKey === 'short' ? S : L;
-          const side = legKey === 'short' ? 'buy' : 'sell';
-          let price;
-          let src = 'факт з біржі';
-          try {
-            price = await ex.lastClosePrice(pos.symbol, side, pos.openedAt);
-          } catch (e) {
-            log.debug(`${ex.id} fetchMyTrades: ${e.message}`);
-          }
-          if (!price) {
-            try {
-              const ob = await ex.fetchOrderBook(pos.symbol);
-              const lv = side === 'buy' ? ob.asks : ob.bids;
-              if (lv[0]) {
-                price = lv[0][0];
-                src = 'оцінка за стаканом';
-              }
-            } catch (e) {
-              log.debug(`${ex.id} orderbook: ${e.message}`);
-            }
-          }
-          if (!price) {
-            price = leg.stopPrice || leg.liq || leg.entry;
-            src = 'оцінка (ціна стопу)';
-          }
+          const { price, src } = await this.externalExitPrice(pos, legKey);
           Object.assign(leg, { contracts: 0, exit: price, exitFee: 0, closedContracts: leg.contracts, exitEstimated: src !== 'факт з біржі' });
           notes.push(`${legKey.toUpperCase()} закрила біржа, ціна ${fmt(price, 8)} (${src})`);
         }
-        const closeLeg = (ex, side, leg) =>
-          leg.contracts > 0
-            ? this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts, { leverage: pos.leverage, marginMode: this.cfg.marginMode, urgent: opt.urgent })
-            : Promise.resolve({ average: leg.exit, fee: leg.exitFee || 0, filled: 0, type: leg.exitType });
+        const closeLeg = async (ex, side, leg, legKey) => {
+          if (!(leg.contracts > 0)) return { average: leg.exit, fee: leg.exitFee || 0, filled: 0, type: leg.exitType };
+          const r = await this.closeLegWithRetry(ex, pos.symbol, side, leg.contracts, { leverage: pos.leverage, marginMode: this.cfg.marginMode, urgent: opt.urgent }, opt.retry ? 2 : 5);
+          if (r && r.externallyClosed && !r.average) {
+            const { price, src } = await this.externalExitPrice(pos, legKey);
+            r.average = price;
+            notes.push(`${legKey.toUpperCase()} закрила біржа, ціна ${fmt(price, 8)} (${src})`);
+          }
+          return r;
+        };
         const shortContracts = pos.short.contracts;
         const longContracts = pos.long.contracts;
-        const [rs, rl] = await Promise.all([closeLeg(S, 'buy', pos.short), closeLeg(L, 'sell', pos.long)]);
+        const [rs, rl] = await Promise.all([closeLeg(S, 'buy', pos.short, 'short'), closeLeg(L, 'sell', pos.long, 'long')]);
         if (rs && pos.short.contracts > 0) Object.assign(pos.short, { contracts: 0, exit: rs.average, exitFee: rs.fee, exitType: rs.type, closedContracts: shortContracts });
         if (rl && pos.long.contracts > 0) Object.assign(pos.long, { contracts: 0, exit: rl.average, exitFee: rl.fee, exitType: rl.type, closedContracts: longContracts });
         if (!rs || !rl) {
@@ -1024,6 +1084,27 @@ class Trader {
     if (this.guard) await this.guard.onTradeClosed(pnl);
     await this.maybeAutoBan(pos.symbol);
     return closed;
+  }
+
+  /** Ціна, за якою біржа сама закрила ногу: факт з історії угод → поточний стакан → ціна стопу. */
+  async externalExitPrice(pos, legKey) {
+    const ex = this.ex[legKey === 'short' ? pos.shortEx : pos.longEx];
+    const side = legKey === 'short' ? 'buy' : 'sell';
+    const leg = pos[legKey];
+    try {
+      const price = await ex.lastClosePrice(pos.symbol, side, pos.openedAt);
+      if (price) return { price, src: 'факт з біржі' };
+    } catch (e) {
+      log.debug(`${ex.id} fetchMyTrades: ${e.message}`);
+    }
+    try {
+      const ob = await ex.fetchOrderBook(pos.symbol);
+      const lv = side === 'buy' ? ob.asks : ob.bids;
+      if (lv[0]) return { price: lv[0][0], src: 'оцінка за стаканом' };
+    } catch (e) {
+      log.debug(`${ex.id} orderbook: ${e.message}`);
+    }
+    return { price: leg.stopPrice || leg.liq || leg.entry, src: 'оцінка (ціна стопу)' };
   }
 
   /** Монета дала autoBanLosses збиткових угод поспіль — у чорний список (зняти: /coinreset). */
