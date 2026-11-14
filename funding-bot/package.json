@@ -18,5 +18,8 @@
   "dependencies": {
     "ccxt": "^4.5.92",
     "dotenv": "^16.4.5"
+  },
+  "overrides": {
+    "undici": "^7.30.2"
   }
 }
