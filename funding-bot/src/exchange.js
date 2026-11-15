@@ -137,6 +137,8 @@ class Exchange {
   }
 
   setCredentials(c = {}) {
+    // новий ключ може бути від акаунта в іншому режимі (Bitget UTA / класичний) — визначимо заново
+    if (this.meta && this.meta.ccxt === 'bitget' && this.client.options) this.client.options.uta = undefined;
     this.client.apiKey = c.apiKey || undefined;
     this.client.secret = c.secret || undefined;
     this.client.password = c.password || undefined;
@@ -149,6 +151,15 @@ class Exchange {
   }
 
   async init() {
+    // Поправка на годинник ДО першого підписаного запиту: ccxt інакше застосовує її вже після
+    // fetchCurrencies (Bybit відхиляє запити, якщо наш час випереджає біржу більш ніж на 1 с)
+    if (this.client.options && this.client.options.adjustForTimeDifference && typeof this.client.loadTimeDifference === 'function') {
+      try {
+        await this.client.loadTimeDifference();
+      } catch (e) {
+        log.debug(`${this.id} loadTimeDifference: ${e.message}`);
+      }
+    }
     await this.client.loadMarkets(true);
     this.buildSymbolMap();
     if (this.client.has.fetchFundingIntervals) {
@@ -162,6 +173,7 @@ class Exchange {
         log.debug(`${this.id}: fetchFundingIntervals failed: ${e.message}`);
       }
     }
+    if (this.hasKeys) await this.detectAccountMode();
     this.ready = true;
     log.info(`${this.title}: завантажено ${this.perpSymbols().length} перпетуалів${this.hasKeys ? ', API-ключ є' : ', без ключа (лише дані)'}`);
   }
@@ -417,8 +429,39 @@ class Exchange {
     this.leverageSet.add(key);
   }
 
+  /**
+   * Bitget: акаунт у режимі Unified Account (UTA) не приймає «класичне» API (помилка 40085).
+   * Розпізнаємо це і перемикаємо ccxt на UTA-запити.
+   */
+  isClassicApiRejected(e) {
+    return this.meta.ccxt === 'bitget' && /40085|Unified Account mode/i.test((e && e.message) || '');
+  }
+
+  switchToUta() {
+    if (this.client.options.uta === true) return false;
+    this.client.options.uta = true;
+    log.info(`${this.title}: акаунт у режимі Unified Account — перемикаю на відповідне API`);
+    return true;
+  }
+
+  async detectAccountMode() {
+    if (this.meta.ccxt !== 'bitget') return;
+    try {
+      await this.client.fetchBalance(this.meta.balanceParams ?? { type: 'swap' });
+    } catch (e) {
+      if (this.isClassicApiRejected(e)) this.switchToUta();
+      else log.debug(`${this.id} detectAccountMode: ${e.message}`);
+    }
+  }
+
   async fetchBalanceRaw() {
-    return this.client.fetchBalance(this.meta.balanceParams ?? { type: 'swap' });
+    try {
+      return await this.client.fetchBalance(this.meta.balanceParams ?? { type: 'swap' });
+    } catch (e) {
+      // ключ змінили через Telegram на UTA-акаунт — перемикаємось і пробуємо ще раз
+      if (this.isClassicApiRejected(e) && this.switchToUta()) return this.client.fetchBalance(this.meta.balanceParams ?? { type: 'swap' });
+      throw e;
+    }
   }
 
   /** Вільна маржа для ф'ючерсів (у USDT або USD для Kraken). */
@@ -583,7 +626,10 @@ class Exchange {
     const t0 = Date.now();
     const server = await this.client.fetchTime();
     const t1 = Date.now();
-    return server - (t0 + t1) / 2;
+    const offset = server - (t0 + t1) / 2;
+    // тримаємо поправку ccxt актуальною: годинник ПК з часом «пливе»
+    if (this.client.options && this.client.options.adjustForTimeDifference) this.client.options.timeDifference = Math.round(-offset);
+    return offset;
   }
 
   /** Обсяги торгів за 24 год (USDT) по всіх монетах. */

@@ -121,3 +121,42 @@ test('Bitget: час виплат з окремого запиту; якщо й 
   const iv = 8 * 3600000;
   assert.equal(r.nextTs, Math.floor(Date.now() / iv) * iv + iv);
 });
+
+test('Bitget Unified Account: помилку 40085 розпізнаємо і перемикаємо ccxt на UTA', async () => {
+  const { fakeClient } = require('./helpers');
+  const c = fakeClient();
+  c.options = {};
+  const calls = [];
+  c.fetchBalance = async () => {
+    calls.push(c.options.uta === true ? 'uta' : 'classic');
+    if (c.options.uta !== true) throw new Error('bitget {"code":"40085","msg":"You are in Unified Account mode, and the Classic Account API is not supported at this time"}');
+    return { free: { USDT: 55 }, total: { USDT: 60 } };
+  };
+  const ex = new Exchange('bitget', { apiKey: 'k', secret: 's', password: 'p' }, { client: c });
+  await ex.init();
+  assert.equal(c.options.uta, true, 'при підключенні режим визначено');
+  assert.equal(await ex.freeBalance(), 55);
+  // новий ключ через Telegram — режим визначається заново (і так само перемикається на першому запиті)
+  ex.setCredentials({ apiKey: 'k2', secret: 's2', password: 'p2' });
+  assert.equal(c.options.uta, undefined);
+  assert.equal((await ex.balanceSummary()).free, 55);
+  assert.deepEqual(calls, ['classic', 'uta', 'classic', 'uta']); // визначення режиму, баланс; новий ключ: спроба класичним, перемикання, баланс
+});
+
+test('поправка годинника передається ccxt до першого запиту і оновлюється', async () => {
+  const { fakeClient } = require('./helpers');
+  const c = fakeClient();
+  c.options = { adjustForTimeDifference: true };
+  const order = [];
+  c.loadTimeDifference = async () => { order.push('time'); c.options.timeDifference = 1200; };
+  const origLoad = c.loadMarkets.bind(c);
+  c.loadMarkets = async (...a) => { order.push('markets'); return origLoad(...a); };
+  c.has.fetchTime = true;
+  c.fetchTime = async () => Date.now() - 1200; // наш годинник поспішає на 1.2 с
+  const ex = new Exchange('bybit', {}, { client: c });
+  await ex.init();
+  assert.deepEqual(order.slice(0, 2), ['time', 'markets']);
+  const off = await ex.clockOffset();
+  assert.ok(Math.abs(off + 1200) < 50);
+  assert.ok(Math.abs(c.options.timeDifference - 1200) < 50);
+});
