@@ -157,7 +157,7 @@ class Trader {
    * і перевіряємо, що обидві біржі дають рівно цю кількість.
    */
   sizePair(symbol, S, L, price, target) {
-    if (!(target > 0)) return { error: 'не задано кількість монет (/qty)' };
+    if (!(target > 0)) return { error: this.cfg.sizeMode === 'coins' ? 'не задано кількість монет (/qty)' : 'розрахований розмір угоди — 0' };
     const step = this.pairStep(symbol, S, L);
     const base = step ? floorToStep(target, step) : Math.min(S.contractsToBase(symbol, S.baseToContracts(symbol, target)), L.contractsToBase(symbol, L.baseToContracts(symbol, target)));
     if (!(base > 0)) return { error: `кількість ${fmt(target, 8)} менша за спільний крок лота обох бірж (${fmt(step, 8)})` };
@@ -286,10 +286,23 @@ class Trader {
         limitedBy = 'ціна/прибутковість (чим більше обсяг, тим гірша ціна)';
       }
     }
+    // Якщо зайти не можна навіть на мінімальний обсяг — чому саме (для журналу і повідомлень)
+    let zeroReason;
+    {
+      const fees = 2 * (S.takerFee(symbol) + L.takerFee(symbol));
+      const basis0 = (bidS - askL) / askL; // найкращі ціни: продаємо на S по bid, купуємо на L по ask
+      const net0 = funding !== undefined ? funding - fees + Math.min(basis0, 0) : undefined;
+      if (basis0 < -cfg.maxEntryBasisPct) {
+        zeroReason = `ціна на ${shortEx} (${fmt(bidS, 8)}) нижча, ніж на ${longEx} (${fmt(askL, 8)}), на ${pct(-basis0)} — допуск різниці цін проти нас ${pct(cfg.maxEntryBasisPct)}`;
+      } else if (net0 !== undefined && net0 < cfg.minProfit) {
+        zeroReason = `чистий прибуток навіть на мінімальному обсязі ${pct(net0)} (фандінг ${pct(funding)} − комісії ${pct(fees)}${basis0 < 0 ? ` − різниця цін ${pct(-basis0)}` : ''}) < порогу ${pct(cfg.minProfit)}`;
+      }
+    }
     // Однакова кількість на обох біржах — кратна спільному кроку лотів
     const step = this.pairStep(symbol, S, L);
     const exact = Number.isFinite(base) ? (step ? floorToStep(base, step) : base) : 0;
-    return { base: exact, raw: base, step, leverage, mid, limits, limitedBy, books: { obS, obL } };
+    if (!(exact > 0) && !zeroReason) zeroReason = Number.isFinite(base) && step && base < step ? `обсяг ${fmt(base, 8)} менший за спільний крок лота ${fmt(step, 8)}` : `обмежує: ${limitedBy}`;
+    return { base: exact, raw: base, step, leverage, mid, limits, limitedBy, zeroReason: exact > 0 ? undefined : zeroReason, books: { obS, obL } };
   }
 
   capacityText(cap) {
@@ -338,6 +351,7 @@ class Trader {
       const bidS = obS.bids[0][0];
       const askL = obL.asks[0][0];
       const auto = this.cfg.sizeMode === 'auto';
+      if (auto && !(cap.base > 0)) return skip(`зайти не можна навіть на мінімальну суму — ${cap.zeroReason}`);
       const target = auto ? cap.base : this.targetBase(symbol, mid);
       if (!auto && target > cap.base * 1.0001) {
         return skip(`стакан/маржа не витримає ${fmt(target * mid, 0)} ${this.cfg.quote}: можна до ~${fmt(cap.base * mid, 0)} (обмежує ${cap.limitedBy})`);

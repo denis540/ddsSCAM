@@ -190,3 +190,30 @@ test('часткове виконання на виході — бот доза�
   assert.ok(Math.abs(closes.reduce((x, o) => x + o.amount * (o === closes[0] ? 0.5 : 1), 0) - base) < 1e-9);
   assert.ok(b);
 });
+
+test('зайти не можна навіть на мінімум — справжня причина, а не «не задано кількість монет»', async () => {
+  const { a, trader, w } = await setup({ maxEntryBasisPct: 0.0015 });
+  a.client.book = { bids: [[99.5, 1e6]], asks: [[99.52, 1e6]] }; // на біржі шорту ціна на 0.5% нижча
+  const cap = await trader.estimateCapacity(w);
+  assert.equal(cap.base, 0);
+  assert.match(cap.zeroReason, /ціна на a .* нижча, ніж на b .* на 0\.5\d*% — допуск/);
+  const logs = [];
+  const log = require('../src/logger');
+  const orig = log.info;
+  log.info = (m) => { logs.push(String(m)); };
+  try {
+    assert.equal(await trader.tryOpen(w), false);
+  } finally {
+    log.info = orig;
+  }
+  assert.ok(logs.some((l) => /зайти не можна навіть на мінімальну суму — ціна на a/.test(l)), logs.join('\n'));
+  assert.ok(!logs.some((l) => /не задано кількість/.test(l)));
+});
+
+test('поріг прибутку недосяжний навіть на мінімумі — пишемо розклад фандінг/комісії/поріг', async () => {
+  const { trader, w, cfg } = await setup();
+  cfg.minProfit = 0.05; // поріг підняли вже після того, як сканер знайшов вікно
+  const cap = await trader.estimateCapacity(w);
+  assert.equal(cap.base, 0);
+  assert.match(cap.zeroReason, /чистий прибуток навіть на мінімальному обсязі .* < порогу 5\.000%/);
+});

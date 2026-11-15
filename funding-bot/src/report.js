@@ -58,7 +58,11 @@ function formatOpps(wins, cfg, n = 10, exchanges = {}, caps = {}) {
         return (
           `${i + 1}. ${w.symbol}: SHORT ${w.shortEx} / LONG ${w.longEx}, старт через ${duration(w.startTs - now)}${keysTxt}\n${ev}\n` +
           `   фандінг ${pct(w.funding)}${w.estimated ? ' (частково оцінка)' : ''}, комісії ${pct(w.fees)}, чистий ${pct(w.net)}` +
-          (caps[i] ? `\n   💧 зайти зараз можна на ≈ ${fmt(caps[i].base * caps[i].mid, 0)} ${cfg.quote} (обмежує: ${caps[i].limitedBy})` : '')
+          (caps[i]
+            ? caps[i].base > 0
+              ? `\n   💧 зайти зараз можна на ≈ ${fmt(caps[i].base * caps[i].mid, 0)} ${cfg.quote} (обмежує: ${caps[i].limitedBy})`
+              : `\n   ⛔ зайти зараз не можна: ${caps[i].zeroReason}`
+            : '')
         );
       })
       .join('\n\n')
