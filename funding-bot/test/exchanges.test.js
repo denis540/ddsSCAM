@@ -86,3 +86,9 @@ test('KeyStore: ключі з Telegram мають пріоритет над .env
   assert.equal(ks.get('okx').apiKey, 'envkey');
   assert.equal(ks.source('bybit'), undefined);
 });
+
+test('біржі з непідтвердженим масштабом ставок (Kraken) не дають угод, доки не TRUST_RATES', () => {
+  const { untrustedRates } = require('../src/exchanges-meta');
+  assert.deepEqual(untrustedRates(['binance', 'kraken', 'okx']), ['kraken']);
+  assert.deepEqual(untrustedRates(['binance', 'kraken'], ['kraken']), []);
+});

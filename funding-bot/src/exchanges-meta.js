@@ -10,6 +10,7 @@
  * obLimit      — глибина стакану, яку просимо (null — як віддає біржа). За замовчуванням 50.
  * testEnv      — тестове середовище для SANDBOX=true: 'sandbox' (testnet ccxt), 'demo' (Demo Trading), false (немає).
  *                Можна перевизначити в .env: TESTENV_BINANCE=demo|sandbox тощо.
+ * rateUnverified — масштаб ставок біржі не підтверджено: угод з нею немає, доки не TRUST_RATES=<біржа>.
  * hourAligned  — біржа не віддає час виплати, але платить рівно на початку кожного інтервалу (UTC).
  */
 const META = {
@@ -78,6 +79,9 @@ const META = {
     keyHint: 'API Management → права Perpetual Futures Trading.',
   },
   kraken: {
+    // Ставки на реальних даних ~6.5× більші, ніж на інших біржах (npm run check, розділ 4) — масштаб не підтверджено.
+    // Поки не перевірено, Kraken не дає угод (лише довідка). Увімкнути: TRUST_RATES=kraken
+    rateUnverified: true,
     testEnv: 'sandbox', // demo-futures.kraken.com (можливо, закрито — перевірить npm run check)
     title: 'Kraken Futures',
     ccxt: 'krakenfutures',
@@ -107,4 +111,9 @@ function metaOf(name) {
   return META[normalizeName(name)] || { title: name, ccxt: normalizeName(name), options: { defaultType: 'swap' }, settles: ['USDT'] };
 }
 
-module.exports = { META, normalizeName, metaOf, SUPPORTED: Object.keys(META) };
+/** Біржі, ставкам яких бот не довіряє для угод (див. rateUnverified). */
+function untrustedRates(ids, trusted = []) {
+  return ids.filter((id) => META[id] && META[id].rateUnverified && !trusted.includes(id));
+}
+
+module.exports = { META, normalizeName, metaOf, untrustedRates, SUPPORTED: Object.keys(META) };

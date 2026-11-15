@@ -102,6 +102,7 @@ const config = {
   maxClockSkewMs: num('MAX_CLOCK_SKEW_MS', 1500), // попередження, якщо годинник сервера розходиться з біржами
   heartbeatHours: num('HEARTBEAT_HOURS', 3), // повідомлення «я працюю» в Telegram (0 = вимк.)
   sandbox: bool('SANDBOX', false),
+  trustRates: list('TRUST_RATES').map(normalizeName), // біржі з непідтвердженим масштабом ставок, яким все ж довіряти (напр. kraken)
   // перевизначення тестового середовища для біржі: TESTENV_BINANCE=demo (Demo Trading) або sandbox (Testnet)
   testEnv: Object.fromEntries(exchanges.map((id) => [id, process.env[`TESTENV_${id.toUpperCase()}`]]).filter(([, v]) => v)), // тестові мережі бірж (Binance, Bybit, OKX, BingX, Kraken)
   fundingConfirmSec: num('FUNDING_CONFIRM_SEC', 90), // live: чекати, поки біржа покаже нарахування фандінгу, до N с

@@ -18,6 +18,7 @@ const { runBacktest } = require('../src/backtest');
 const { sanitize } = require('../src/telegram');
 const { Settings } = require('../src/settings');
 const { CoinRegistry } = require('../src/coins');
+const { untrustedRates } = require('../src/exchanges-meta');
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(`--${n}`);
@@ -134,6 +135,33 @@ const timed = async (fn) => {
     else out(`${id}: ${ratios.length} монет, медіана співвідношення ${mr.toFixed(2)}${mr > 5 || mr < 0.2 ? '  ⚠️ ПІДОЗРІЛО — можливо, ставка в іншому масштабі' : ' (норма ≈ 1)'}`);
   }
 
+  // 4б) Kraken: сирі поля, щоб з'ясувати масштаб ставки (ставка / ціна; прогноз; фактичні виплати з історії)
+  if (ex.kraken) {
+    out('\n== 4б. Kraken: діагностика масштабу ставки ==');
+    try {
+      const raw = await ex.kraken.client.fetchFundingRates();
+      for (const coin of ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE']) {
+        const sym = `${coin}/USDT:USDT`;
+        const nat = ex.kraken.native[sym];
+        const fr = nat && raw[nat];
+        if (!fr) continue;
+        const info = fr.info || {};
+        let hist = '';
+        try {
+          const h = await ex.kraken.client.fetchFundingRateHistory(nat, Date.now() - 6 * 3600000);
+          hist = h.slice(-3).map((x) => `${new Date(x.timestamp).toISOString().slice(11, 16)} ${pct(x.fundingRate, 5)}`).join(', ');
+        } catch (e) {
+          hist = `історія: ${e.message.slice(0, 80)}`;
+        }
+        const others = Object.keys(rates).filter((o) => o !== 'kraken' && rates[o][sym]).map((o) => `${o} ${pct(rates[o][sym].rate / (rates[o][sym].intervalH || 8), 5)}/год`);
+        out(`${coin}: ccxt ${pct(fr.fundingRate, 5)} (прогноз ${pct(fr.nextFundingRate, 5)}); сире fundingRate=${info.fundingRate}, fundingRatePrediction=${info.fundingRatePrediction}, markPrice=${info.markPrice}` +
+          `\n      виплати з історії: ${hist}\n      інші біржі: ${others.join(', ')}`);
+      }
+    } catch (e) {
+      out(`❌ ${e.message.slice(0, 200)}`);
+    }
+  }
+
   // 5) Стакани
   out('\n== 5. Стакани (BTC) ==');
   for (const e of Object.values(ex)) {
@@ -166,8 +194,12 @@ const timed = async (fn) => {
     return p ? { ok: false, reason: p } : coins.check(coin, a, b, ma, mb);
   };
   const fee = (id, s) => ex[id].takerFee(s);
-  const raw = planWindows(rates, cfg, fee);
-  const wins = planWindows(rates, cfg, fee, Date.now(), coinCheck);
+  const untrusted = untrustedRates(Object.keys(rates), cfg.trustRates);
+  const tradeRates = { ...rates };
+  for (const id of untrusted) delete tradeRates[id];
+  if (untrusted.length) out(`Не беруть участі (масштаб ставок не підтверджено): ${untrusted.join(', ')} — увімкнути: TRUST_RATES=${untrusted.join(',')}`);
+  const raw = planWindows(tradeRates, cfg, fee);
+  const wins = planWindows(tradeRates, cfg, fee, Date.now(), coinCheck);
   out(`Вікон за порогами (фандінг ≥ ${pct(cfg.minFunding, 2)}, чистий ≥ ${pct(cfg.minProfit, 2)}): ${raw.length}; з них проходять фільтри бота: ${wins.length}`);
   for (const w of raw.slice(0, 15)) {
     const coin = w.symbol.split('/')[0];
@@ -197,7 +229,9 @@ const timed = async (fn) => {
   if (days > 0) {
     out(`\n== 8. Перевірка на історії за ${days} дн ==`);
     try {
-      const r = await runBacktest({ exchanges: ex, cfg, days, maxCoins: arg('coins', 40), rates, onProgress: (d, n) => process.stdout.write(`\r   ${d}/${n} монет`) });
+      const btEx = { ...ex };
+      for (const id of untrustedRates(Object.keys(btEx), cfg.trustRates)) delete btEx[id];
+      const r = await runBacktest({ exchanges: btEx, cfg, days, maxCoins: arg('coins', 40), rates, onProgress: (d, n) => process.stdout.write(`\r   ${d}/${n} монет`) });
       process.stdout.write('\n');
       out(r.text);
     } catch (err) {

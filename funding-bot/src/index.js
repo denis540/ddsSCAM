@@ -10,6 +10,7 @@ try {
   process.exit(1);
 }
 const { Exchange } = require('./exchange');
+const { untrustedRates } = require('./exchanges-meta');
 const { planWindows, dueWindows } = require('./scanner');
 const { Trader } = require('./trader');
 const { State } = require('./state');
@@ -239,7 +240,11 @@ async function main() {
     await tg.start({
       cfg, settings, state, trader, keys, all, exchanges, initErrors, coins, guard, reconciler, marketProblem,
       checkPositionMode, applySelfTest, onKeyAdded: (ex) => prepareKeyedExchange(ex),
-      runBacktest: (days) => runBacktest({ exchanges, cfg, days, maxCoins: 40, rates: lastRates }),
+      runBacktest: (days) => {
+        const exs = { ...exchanges };
+        for (const id of untrustedRates(Object.keys(exs), cfg.trustRates)) delete exs[id];
+        return runBacktest({ exchanges: exs, cfg, days, maxCoins: 40, rates: lastRates });
+      },
       getRates: () => lastRates,
       getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
@@ -327,7 +332,10 @@ async function main() {
     if (Date.now() - statusAt > 5 * MIN) await checkStatuses();
     if (Date.now() - imbalanceAt > 30 * MIN) await checkImbalance().catch((e) => log.debug(`imbalance: ${e.message}`));
     const rates = await fetchAllRates();
-    let wins = planWindows(rates, cfg, takerFee, nowSynced(), coinCheck);
+    // біржі з непідтвердженим масштабом ставок не беруть участі в угодах (лише довідка)
+    const tradeRates = { ...rates };
+    for (const id of untrustedRates(Object.keys(rates), cfg.trustRates)) delete tradeRates[id];
+    let wins = planWindows(tradeRates, cfg, takerFee, nowSynced(), coinCheck);
     // У режимі монет торгуємо лише ті монети, для яких задано кількість
     if (cfg.sizeMode === 'coins') wins = wins.filter((w) => cfg.coinQty[coinOf(w.symbol)] > 0);
     lastRates = rates;
