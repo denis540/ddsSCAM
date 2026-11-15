@@ -342,6 +342,19 @@ async function main() {
     lastWindows = wins;
     lastScanAt = Date.now();
     printTable(wins, cfg.topN);
+    // Підсумок скану в журнал: видно, що бот бачить і коли наступний вхід (навіть якщо угод немає)
+    const now = nowSynced();
+    const upcoming = wins.filter((w) => w.startTs - now > cfg.entryMinSec * 1000).sort((a, b) => a.startTs - b.startTs || b.net - a.net);
+    const next = upcoming[0];
+    const ok = Object.entries(rates).map(([id, r]) => `${id}:${Object.keys(r).length}`).join(' ');
+    log.info(
+      `Скан: ставки ${ok}; вікон за порогами і фільтрами: ${wins.length}` +
+        (next
+          ? `; найближчий вхід — ${coinOf(next.symbol)} SHORT ${next.shortEx}/LONG ${next.longEx}, виплата ${clock(next.startTs, cfg.timezone)} (через ${duration(next.startTs - now)}, вхід за ${cfg.entryBeforeSec} с), чистий ${pct(next.net)}`
+          : '') +
+        (cfg.paused ? `; ⏸ ПАУЗА${cfg.pauseReason ? `: ${cfg.pauseReason}` : ''}` : '') +
+        (state.positions.length >= cfg.maxPositions ? `; макс. позицій зайнято (${state.positions.length}/${cfg.maxPositions})` : '')
+    );
   };
 
   // ---- Техроботи на біржах: не входимо, поки біржа не в нормі ----
@@ -469,7 +482,13 @@ async function main() {
     const wait = (scanOnly ? cfg.scanIntervalSec : cfg.tickSec) * 1000 - (Date.now() - started);
     for (let t = 0; t < wait && !stopping; t += 250) await sleep(Math.min(250, wait - t));
   }
-  if (!scanOnly) await notify(`🛑 Бот зупинено. Відкритих позицій: ${state.positions.length} (залишаються на біржах, стопи на біржах стоять)`);
+  if (!scanOnly) {
+    const left = state.positions.length;
+    await notify(
+      `🛑 Бот зупинено. Відкритих позицій: ${left}` +
+        (left ? (cfg.mode === 'live' ? ' (залишаються на біржах, стопи на біржах стоять)' : ' (paper: після запуску бот продовжить їх супровід)') : '')
+    );
+  }
 }
 
 main().catch((e) => {

@@ -314,6 +314,7 @@ class Trader {
     if (!this.paper && (S.tradeBlocked || L.tradeBlocked)) return false; // hedge mode, самоперевірка, розбіжність фандінгу
     if (S.maintenance || L.maintenance) return false; // техроботи на біржі — можна не закрити позицію
     this.busy.add(symbol);
+    log.info(`${symbol} SHORT ${shortEx}/LONG ${longEx}: до виплати ${duration(win.startTs - now)} — перевіряю вхід (ставки, стакани, розмір)`);
     const skip = (why) => {
       this.skipped.set(key, win.startTs);
       log.info(`${symbol} ${shortEx}/${longEx} (виплата ${clock(win.startTs, this.cfg.timezone)}): пропуск — ${why}`);
