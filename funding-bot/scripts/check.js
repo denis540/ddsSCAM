@@ -16,6 +16,7 @@ const { KeyStore } = require('../src/keys');
 const { planWindows } = require('../src/scanner');
 const { runBacktest } = require('../src/backtest');
 const { sanitize } = require('../src/telegram');
+const { Settings } = require('../src/settings');
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(`--${n}`);
@@ -41,9 +42,16 @@ const timed = async (fn) => {
 };
 
 (async () => {
+  // ті самі налаштування, що й у бота: .env + змінене через Telegram (data/settings.json)
+  try {
+    new Settings(cfg, cfg.settingsFile);
+  } catch (e) {
+    console.warn(`data/settings.json не прочитано: ${e.message}`);
+  }
   out(`ДІАГНОСТИКА funding-bot — ${new Date().toISOString()}`);
   out(`Node ${process.version}, ${process.platform}; режим ${cfg.mode}${cfg.sandbox ? ' (SANDBOX)' : ''}`);
-  out(`Біржі в налаштуваннях: ${cfg.exchanges.join(', ')}\n`);
+  out(`Біржі в налаштуваннях: ${cfg.exchanges.join(', ')}`);
+  out(`Пороги: фандінг ≥ ${pct(cfg.minFunding, 2)}, чистий ≥ ${pct(cfg.minProfit, 2)}; сума ${cfg.maxTradeUsdt} × плече ${cfg.leverage}\n`);
 
   let keys;
   try {

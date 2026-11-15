@@ -436,7 +436,7 @@ test('самоперевірка: безпечна і повна; критичн
   a.client.markets[SYM].limits.amount.min = 0.001;
   let r = await a.runSelfTest();
   assert.ok(r.ok, JSON.stringify(r.checks));
-  assert.ok(r.checks.find((c) => c.name.startsWith('лімітний IOC')).ok);
+  assert.ok(r.checks.find((c) => c.name.startsWith('права на торгівлю')).ok);
   assert.equal(a.client.orders.at(-1).type, 'limit');
   assert.equal(a.client.pos[SYM] || 0, 0, 'IOC не виконався — позиції немає');
   a.client.limitFill = 0;
@@ -483,4 +483,19 @@ test('самоперевірка не чіпає монети, по яких б�
   const r2 = await a.runSelfTest({ full: true, avoid: [ETH, 'BTC/USDT:USDT'] });
   assert.equal(r2.ok, false);
   assert.match(r2.checks[0].info, /усі монети зайняті/);
+});
+
+test('самоперевірка: немає права на торгівлю — критично; немає коштів — права є', async () => {
+  const { a } = await setup();
+  a.client.markets[SYM].limits.amount.min = 0.001;
+  const orig = a.client.createOrder.bind(a.client);
+  a.client.createOrder = async () => { throw new Error('okx {"msg":"This API key doesn\'t have permission to use this function","code":"50120"}'); };
+  let r = await a.runSelfTest();
+  assert.equal(r.ok, false);
+  assert.match(r.checks.find((c) => c.name.startsWith('права')).info, /немає права на торгівлю/);
+  a.client.createOrder = async () => { throw new Error('binance {"code":-2019,"msg":"Margin is insufficient."}'); };
+  r = await a.runSelfTest();
+  assert.ok(r.ok);
+  assert.match(r.checks.find((c) => c.name.startsWith('права')).info, /права на торгівлю є/);
+  a.client.createOrder = orig;
 });

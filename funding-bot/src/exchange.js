@@ -684,15 +684,29 @@ class Exchange {
       if (!ob.bids[0] || !ob.asks[0]) throw new Error('порожній стакан');
       return `${sym.split('/')[0]} ${ob.bids[0][0]}`;
     });
-    await step('лімітний IOC (без виконання)', async () => {
-      const ob = await this.fetchOrderBook(sym);
-      const price = ob.bids[0][0] * 0.97; // нижче ринку — купівля не виконається
-      const minB = Math.max(this.minBaseAmount(sym, price), this.amountStep(sym) || 0);
-      const c = Math.max(this.baseToContracts(sym, minB * 1.05), ((this.market(sym).limits || {}).amount || {}).min || 0);
-      const o = await this.limitIOC(sym, 'buy', c, price, {});
-      if (o.filled > 0) throw new Error(`несподівано виконався на ${o.filled} — закрийте вручну!`);
-      return 'біржа приймає IOC';
-    }, false);
+    // Права на торгівлю: тестовий ордер, що не виконається. Відмова через нестачу коштів означає,
+    // що права є (біржа дійшла до перевірки маржі); відмова через права — критична помилка.
+    const ioc = await (async () => {
+      try {
+        const ob = await this.fetchOrderBook(sym);
+        const price = ob.bids[0][0] * 0.97; // нижче ринку — купівля не виконається
+        const minB = Math.max(this.minBaseAmount(sym, price), this.amountStep(sym) || 0);
+        const c = Math.max(this.baseToContracts(sym, minB * 1.05), ((this.market(sym).limits || {}).amount || {}).min || 0);
+        const o = await this.limitIOC(sym, 'buy', c, price, {});
+        if (o.filled > 0) return { ok: false, critical: true, info: `несподівано виконався на ${o.filled} — закрийте вручну!` };
+        return { ok: true, info: 'права на торгівлю є, біржа приймає IOC' };
+      } catch (e) {
+        const m = e.message || '';
+        if (e instanceof ccxt.PermissionDenied || e instanceof ccxt.AuthenticationError || /permission|not authori[sz]ed|invalid api|api[- ]?key|-2015|50120|10005|forbidden/i.test(m)) {
+          return { ok: false, critical: true, info: `немає права на торгівлю ф'ючерсами — увімкніть його в налаштуваннях API-ключа (${m.slice(0, 120)})` };
+        }
+        if (e instanceof ccxt.InsufficientFunds || /insufficient|margin is insufficient|insufficientab|not enough|balance/i.test(m)) {
+          return { ok: true, info: 'права на торгівлю є (біржа відмовила лише через нестачу коштів)' };
+        }
+        return { ok: false, critical: false, info: m.slice(0, 160) };
+      }
+    })();
+    checks.push({ name: 'права на торгівлю (тестовий ордер без виконання)', ...ioc });
     await step('історія фандінгу', async () => {
       await this.client.fetchFundingHistory(this.n(sym), Date.now() - 86400000);
       return 'читається';
