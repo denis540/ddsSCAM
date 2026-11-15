@@ -9,7 +9,15 @@ const fs = require('fs');
 const path = require('path');
 const util = require('util');
 
-const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+// Час у журналі — у часовому поясі TIMEZONE (як у Telegram), а не UTC
+const TZ = process.env.TIMEZONE || 'Europe/Kyiv';
+const ts = () => {
+  try {
+    return new Date().toLocaleString('sv-SE', { timeZone: TZ, hour12: false });
+  } catch {
+    return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  }
+};
 const LOG_DIR = process.env.LOG_DIR || path.join(__dirname, '..', 'logs');
 const toFile =
   String(process.env.LOG_TO_FILE || 'true').toLowerCase() !== 'false' &&
@@ -28,7 +36,7 @@ function writeFile(line) {
   if (!toFile || failed) return;
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    fs.appendFileSync(path.join(LOG_DIR, `bot-${new Date().toISOString().slice(0, 10)}.log`), `${sanitize(line)}\n`);
+    fs.appendFileSync(path.join(LOG_DIR, `bot-${ts().slice(0, 10)}.log`), `${sanitize(line)}\n`);
   } catch (e) {
     failed = true; // не заважаємо роботі бота, якщо диск недоступний
     console.error(`[${ts()}] ERROR журнал у файл вимкнено: ${e.message}`);
