@@ -105,3 +105,27 @@ test('монети: перевірка через кнопку, кількіст
   await tg.handleCallback('qtydel:BTC', '42');
   assert.deepEqual(cfg.coinQty, { ETH: 0.5 });
 });
+
+test('Telegram: Id, якому не можна писати, — одне зрозуміле попередження з Id, інші отримують повідомлення', async () => {
+  const log = require('../src/logger');
+  const tg = new Telegram({ token: 't', chatIds: ['42', '777'] });
+  const sentTo = [];
+  tg.api = async (m, b) => {
+    if (b.chat_id === '777') throw new Error('sendMessage: Bad Request: chat not found');
+    sentTo.push(b.chat_id);
+    return {};
+  };
+  const warns = [];
+  const orig = log.warn;
+  log.warn = (m) => { warns.push(String(m)); };
+  try {
+    await tg.send('перше');
+    await tg.send('друге');
+  } finally {
+    log.warn = orig;
+  }
+  assert.deepEqual(sentTo, ['42', '42'], 'основний отримувач отримує все');
+  assert.equal(warns.length, 1, 'попередження одне, без спаму');
+  assert.match(warns[0], /Id 777/);
+  assert.match(warns[0], /не натиснув Start/);
+});

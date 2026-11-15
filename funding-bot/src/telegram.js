@@ -219,7 +219,12 @@ class Telegram {
       cur += `${line}\n`;
     }
     if (cur.trim()) chunks.push(cur);
+    this.unreachable = this.unreachable || {}; // id -> { since, warnedAt }
     for (const id of targets) {
+      // Id, якому бот не може писати (не натиснув Start / помилка в Id / заблокував бота):
+      // пропускаємо 5 хв, потім пробуємо знову — щойно людина натисне Start, повідомлення підуть
+      const u = this.unreachable[id];
+      if (u && Date.now() - u.since < 5 * 60000) continue;
       for (let i = 0; i < chunks.length; i++) {
         const last = i === chunks.length - 1;
         try {
@@ -229,8 +234,24 @@ class Telegram {
             disable_web_page_preview: true,
             reply_markup: last && markup ? markup : KEYBOARD,
           });
+          if (this.unreachable[id]) {
+            log.info(`Telegram: Id ${id} знову отримує повідомлення`);
+            delete this.unreachable[id];
+          }
         } catch (e) {
-          log.warn(`Telegram send failed: ${e.message}`);
+          if (/chat not found|bot was blocked|user is deactivated|bot can't initiate|have no rights|PEER_ID_INVALID/i.test(e.message)) {
+            const prev = this.unreachable[id];
+            this.unreachable[id] = { since: Date.now(), warnedAt: prev ? prev.warnedAt : 0 };
+            if (!prev || Date.now() - prev.warnedAt > 6 * 3600000) {
+              this.unreachable[id].warnedAt = Date.now();
+              log.warn(
+                `Telegram: не можу писати на Id ${id} (${e.message}). Найчастіше: цей користувач ще не натиснув Start у боті, ` +
+                  'або Id у TELEGRAM_CHAT_ID з помилкою (має бути число з @userinfobot). Інші отримувачі працюють як звичайно.'
+              );
+            }
+            break;
+          }
+          log.warn(`Telegram send failed (Id ${id}): ${e.message}`);
         }
       }
     }
