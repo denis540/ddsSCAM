@@ -293,6 +293,23 @@ class Exchange {
         }
       }
     }
+    // Деякі біржі (Bitget) у загальному запиті не дають часу виплати — доповнюємо окремим запитом
+    const missing = Object.values(raw).filter((fr) => fr && !(fr.fundingTimestamp || fr.nextFundingTimestamp)).length;
+    if (this.meta.timesParams && missing > 0) {
+      try {
+        const times = await this.client.fetchFundingRates(undefined, this.meta.timesParams);
+        for (const [sym, t] of Object.entries(times || {})) {
+          const key = t.symbol || sym;
+          const fr = raw[key];
+          if (!fr) continue;
+          if (!(fr.fundingTimestamp || fr.nextFundingTimestamp)) fr.fundingTimestamp = t.fundingTimestamp || t.nextFundingTimestamp;
+          if (!fr.interval && t.interval) fr.interval = t.interval;
+          if (!Number.isFinite(fr.fundingRate) && Number.isFinite(t.fundingRate)) fr.fundingRate = t.fundingRate;
+        }
+      } catch (e) {
+        log.warn(`${this.id}: час виплат окремим запитом не отримано (${e.message.slice(0, 120)}) — рахую за інтервалом`);
+      }
+    }
     const out = {};
     for (const [sym, fr] of Object.entries(raw)) {
       const c = this.fromNative[fr.symbol || sym];
@@ -308,7 +325,7 @@ class Exchange {
     const intervalH = parseIntervalHours({ ...fr, symbol: nativeSymbol }, this.intervals);
     // У ccxt fundingTimestamp — час НАЙБЛИЖЧОЇ виплати, nextFundingTimestamp — наступної за нею (OKX)
     let nextTs = fr.fundingTimestamp || fr.nextFundingTimestamp;
-    if (!nextTs && this.meta.hourAligned) {
+    if (!nextTs && (this.meta.hourAligned || this.meta.alignedFallback)) {
       const iv = intervalH * HOUR;
       nextTs = Math.floor(now / iv) * iv + iv; // напр. Kraken: щогодини рівно о :00 UTC
     }

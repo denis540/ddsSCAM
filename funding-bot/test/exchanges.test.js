@@ -92,3 +92,32 @@ test('біржі з непідтвердженим масштабом ставо
   assert.deepEqual(untrustedRates(['binance', 'kraken', 'okx']), ['kraken']);
   assert.deepEqual(untrustedRates(['binance', 'kraken'], ['kraken']), []);
 });
+
+test('Bitget: час виплат з окремого запиту; якщо й там немає — найближча межа інтервалу за UTC', async () => {
+  const { fakeClient } = require('./helpers');
+  const c = fakeClient();
+  const SYM = 'ETH/USDT:USDT';
+  const T = Date.now() + 2 * 3600000;
+  const calls = [];
+  c.fetchFundingRates = async (symbols, params = {}) => {
+    calls.push(params.method || 'tickers');
+    if (params.method) return { [SYM]: { symbol: SYM, fundingRate: 0.0002, fundingTimestamp: T, interval: '4h' } };
+    return { [SYM]: { symbol: SYM, fundingRate: 0.0003, markPrice: 100 } }; // без часу і інтервалу
+  };
+  const ex = new Exchange('bitget', {}, { client: c });
+  await ex.init();
+  let r = (await ex.fetchFundingRates())[SYM];
+  assert.deepEqual(calls, ['tickers', 'publicMixGetV2MixMarketCurrentFundRate']);
+  assert.equal(r.nextTs, T);
+  assert.equal(r.intervalH, 4);
+  assert.equal(r.rate, 0.0003, 'ставка й ціна — з основного запиту');
+  assert.equal(r.mark, 100);
+  // окремий запит не вдався — рахуємо за інтервалом
+  c.fetchFundingRates = async (symbols, params = {}) => {
+    if (params.method) throw new Error('timeout');
+    return { [SYM]: { symbol: SYM, fundingRate: 0.0003, markPrice: 100, interval: '8h' } };
+  };
+  r = (await ex.fetchFundingRates())[SYM];
+  const iv = 8 * 3600000;
+  assert.equal(r.nextTs, Math.floor(Date.now() / iv) * iv + iv);
+});

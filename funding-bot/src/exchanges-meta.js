@@ -11,6 +11,8 @@
  * testEnv      — тестове середовище для SANDBOX=true: 'sandbox' (testnet ccxt), 'demo' (Demo Trading), false (немає).
  *                Можна перевизначити в .env: TESTENV_BINANCE=demo|sandbox тощо.
  * rateUnverified — масштаб ставок біржі не підтверджено: угод з нею немає, доки не TRUST_RATES=<біржа>.
+ * timesParams  — параметри додаткового запиту fetchFundingRates, що містить час виплат (якщо основний його не дає).
+ * alignedFallback — якщо часу виплати так і немає, рахувати його як найближчу межу інтервалу за UTC.
  * hourAligned  — біржа не віддає час виплати, але платить рівно на початку кожного інтервалу (UTC).
  */
 const META = {
@@ -57,6 +59,10 @@ const META = {
     options: { defaultType: 'swap' },
     settles: ['USDT'],
     password: true,
+    // Загальний запит ставок (tickers) не містить часу виплати — беремо його окремим запитом current-fund-rate.
+    // Якщо й там немає — виплати Bitget вирівняні за UTC (00/04/08… або щогодини), рахуємо самі.
+    timesParams: { method: 'publicMixGetV2MixMarketCurrentFundRate' },
+    alignedFallback: true,
     keyHint: 'API Management → права Futures (read/write), потрібна Passphrase.',
   },
   kucoin: {
