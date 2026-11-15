@@ -259,7 +259,7 @@ npm test                  # тести
 0. **Історія** — `npm run backtest -- --days 14`: чи взагалі бувають можливості за вашими порогами і скільки вони дають.
 1. **Сканування** — `npm run scan`: подивитися, які можливості реально бувають і як часто.
 2. **Paper** — `MODE=paper`, `npm start`, кілька днів. Перевірте в Telegram, чи PnL угод після комісій і різниці цін у плюсі.
-3. **Тестові мережі** — `MODE=live`, `SANDBOX=true` і **тестові** API-ключі (testnet Binance/Bybit/OKX/BingX, demo Kraken Futures). Реальні ордери на тестові гроші: `/selftest full`, потім вхід, вихід, стопи, звірка, `/balance`.
+3. **Тестові середовища** — `MODE=live`, `SANDBOX=true` і **демо**-ключі (див. «Тестові середовища: де взяти демо-ключі»). Реальні ордери на тестові гроші: `/selftest full`, потім вхід, вихід, стопи, звірка, `/balance`.
    Для HTX, Bitget і KuCoin тестових мереж немає — для них `/selftest full` на реальному акаунті з мінімальною сумою.
 4. **Live з мінімумом** — `SANDBOX=false`, `MAX_TRADE_USDT=10–20`, `LEVERAGE=2–3`, `MAX_POSITIONS=1`, дві біржі. Кілька днів.
 5. Лише потім збільшуйте суму, плече і кількість пар — поступово.
@@ -277,6 +277,26 @@ pm2 logs funding-bot
 **systemd:** див. `deploy/funding-bot.service` (інструкція всередині).
 
 На сервері також увімкніть синхронізацію часу: `timedatectl set-ntp true`.
+
+## Тестові середовища: де взяти демо-ключі
+
+`SANDBOX=true` у `.env` — бот іде в тестові середовища, ордери реальні, гроші віртуальні. **Ключі демо-середовища відрізняються від звичайних** — створюються окремо:
+
+| Біржа | Де створити ключ | Куди йде бот |
+|---|---|---|
+| Binance | **Futures Testnet**: testnet.binancefuture.com → увійти → API Key. Або **Demo Trading** на binance.com (тоді `TESTENV_BINANCE=demo`) | testnet.binancefuture.com / demo-fapi.binance.com |
+| Bybit | bybit.com → перемкнутися на **Demo Trading** → API → створити ключ (саме Demo Trading, не Testnet) | api-demo.bybit.com |
+| OKX | okx.com → Trade → **Demo Trading** → Personal Center → **Demo Trading API** (потрібна passphrase) | звичайний API + заголовок `x-simulated-trading: 1` |
+| Bitget | bitget.com → перемкнутися на **Demo** → Personal Center → API Key Management → **Create Demo API Key** (потрібна passphrase) | звичайний API + заголовок `PAPTRADING: 1` |
+| BingX | bingx.com → Perpetual Futures → **Demo Trading**; ключ: User Center → API Management | open-api-vst.bingx.com |
+| Kraken Futures | demo-futures.kraken.com — за даними Kraken, старе демо-середовище закрито; `npm run check` покаже, чи воно відповідає | demo-futures.kraken.com |
+| KuCoin, HTX | тестових середовищ, що підтримуються, немає — у SANDBOX вимикаються | — |
+
+Порядок: `SANDBOX=true`, `MODE=live`, демо-ключі в `.env` (`BYBIT_API_KEY=…` тощо) → `npm run check -- --selftest` → у Telegram `/selftest full` (перевіряє стопи) → `npm start`.
+
+Зауваги:
+- на **Binance Futures Testnet** ціни свої (не ринкові), тож пари з ним бот здебільшого відкине як «різні монети» — це нормально; для перевірки ордерів і стопів вистачає `/selftest full`. У Demo Trading Bybit/OKX/Bitget ціни ринкові — між ними бот може знаходити й відкривати угоди;
+- демо-ключі не підійдуть для звичайного режиму і навпаки — помилка авторизації при `npm run check` найчастіше означає саме це.
 
 ## Чек-лист перед live (робите ви)
 

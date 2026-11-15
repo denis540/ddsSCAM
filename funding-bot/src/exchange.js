@@ -111,11 +111,29 @@ class Exchange {
     this.selfTest = undefined; // результат останньої самоперевірки
   }
 
-  /** Тестова мережа біржі (SANDBOX=true). @returns {boolean} чи підтримується */
-  enableSandbox() {
-    if (this.meta.sandbox === false || !(this.client.urls && this.client.urls.test)) return false;
-    this.client.setSandboxMode(true);
-    return true;
+  /**
+   * Тестове середовище біржі (SANDBOX=true): testnet або Demo Trading — залежно від біржі (meta.testEnv)
+   * чи перевизначення TESTENV_<БІРЖА>=sandbox|demo у .env.
+   * @returns {boolean} чи підтримується
+   */
+  enableSandbox(override) {
+    const how = String(override || this.meta.testEnv || '').toLowerCase();
+    const urls = this.client.urls || {};
+    if (how === 'demo') {
+      if (typeof this.client.enableDemoTrading !== 'function') return false;
+      if (!(urls.demo || urls.demotrading) && this.meta.ccxt !== 'bitget') return false;
+      this.client.enableDemoTrading(true);
+      this.testEnv = 'demo';
+      return true;
+    }
+    if (how === 'sandbox' || how === 'testnet') {
+      // Bitget не має окремих URL — демо вмикається заголовком PAPTRADING (ccxt робить це в setSandboxMode)
+      if (!urls.test && this.meta.ccxt !== 'bitget') return false;
+      this.client.setSandboxMode(true);
+      this.testEnv = 'sandbox';
+      return true;
+    }
+    return false;
   }
 
   setCredentials(c = {}) {

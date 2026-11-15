@@ -101,7 +101,9 @@ const config = {
   delistDays: num('DELIST_DAYS', 14), // не торгувати монети з делістингом/експірацією в найближчі N днів
   maxClockSkewMs: num('MAX_CLOCK_SKEW_MS', 1500), // попередження, якщо годинник сервера розходиться з біржами
   heartbeatHours: num('HEARTBEAT_HOURS', 3), // повідомлення «я працюю» в Telegram (0 = вимк.)
-  sandbox: bool('SANDBOX', false), // тестові мережі бірж (Binance, Bybit, OKX, BingX, Kraken)
+  sandbox: bool('SANDBOX', false),
+  // перевизначення тестового середовища для біржі: TESTENV_BINANCE=demo (Demo Trading) або sandbox (Testnet)
+  testEnv: Object.fromEntries(exchanges.map((id) => [id, process.env[`TESTENV_${id.toUpperCase()}`]]).filter(([, v]) => v)), // тестові мережі бірж (Binance, Bybit, OKX, BingX, Kraken)
   fundingConfirmSec: num('FUNDING_CONFIRM_SEC', 90), // live: чекати, поки біржа покаже нарахування фандінгу, до N с
   autoBanLosses: num('AUTOBAN_LOSSES', 3), // монета дала N збиткових угод поспіль — у чорний список (0 = вимк.)
   imbalanceRatio: num('IMBALANCE_RATIO', 2), // попередити, якщо баланс на одній біржі в N разів більший, ніж на іншій (0 = вимк.)

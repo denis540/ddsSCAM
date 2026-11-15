@@ -8,10 +8,13 @@
  * balanceParams— параметри fetchBalance для ф'ючерсного рахунку.
  * openParams   — додаткові параметри ордера на відкриття (деякі біржі інакше ставлять плече x1).
  * obLimit      — глибина стакану, яку просимо (null — як віддає біржа). За замовчуванням 50.
+ * testEnv      — тестове середовище для SANDBOX=true: 'sandbox' (testnet ccxt), 'demo' (Demo Trading), false (немає).
+ *                Можна перевизначити в .env: TESTENV_BINANCE=demo|sandbox тощо.
  * hourAligned  — біржа не віддає час виплати, але платить рівно на початку кожного інтервалу (UTC).
  */
 const META = {
   binance: {
+    testEnv: 'sandbox', // Futures Testnet (testnet.binancefuture.com); TESTENV_BINANCE=demo — Demo Trading (demo-fapi.binance.com)
     title: 'Binance',
     ccxt: 'binance',
     options: { defaultType: 'swap' },
@@ -19,6 +22,7 @@ const META = {
     keyHint: 'API Management → Enable Futures. Без Withdrawals.',
   },
   bybit: {
+    testEnv: 'demo', // Demo Trading (api-demo.bybit.com) — НЕ Testnet; ключі створюються в режимі Demo Trading
     title: 'Bybit',
     ccxt: 'bybit',
     options: { defaultType: 'swap' },
@@ -26,6 +30,7 @@ const META = {
     keyHint: 'API → System-generated, права Contract/Derivatives Trade.',
   },
   htx: {
+    testEnv: false, // тестового середовища для ф'ючерсів немає
     title: 'HTX (Huobi)',
     ccxt: 'htx',
     aliases: ['huobi'],
@@ -36,6 +41,7 @@ const META = {
     keyHint: 'API Management, права Trade. Для USDT-M ф\'ючерсів.',
   },
   okx: {
+    testEnv: 'sandbox', // Demo Trading: заголовок x-simulated-trading: 1
     title: 'OKX',
     ccxt: 'okx',
     options: { defaultType: 'swap' },
@@ -44,6 +50,7 @@ const META = {
     keyHint: 'API → права Trade, потрібна Passphrase.',
   },
   bitget: {
+    testEnv: 'sandbox', // Demo: заголовок PAPTRADING: 1, ключ «Demo API Key»
     title: 'Bitget',
     ccxt: 'bitget',
     options: { defaultType: 'swap' },
@@ -52,6 +59,7 @@ const META = {
     keyHint: 'API Management → права Futures (read/write), потрібна Passphrase.',
   },
   kucoin: {
+    testEnv: false, // ccxt не підтримує sandbox для KuCoin Futures
     title: 'KuCoin Futures',
     ccxt: 'kucoinfutures',
     settles: ['USDT'],
@@ -62,6 +70,7 @@ const META = {
     keyHint: 'API Management → права Futures Trading, потрібна Passphrase.',
   },
   bingx: {
+    testEnv: 'sandbox', // VST (open-api-vst.bingx.com)
     title: 'BingX',
     ccxt: 'bingx',
     options: { defaultType: 'swap' },
@@ -69,6 +78,7 @@ const META = {
     keyHint: 'API Management → права Perpetual Futures Trading.',
   },
   kraken: {
+    testEnv: 'sandbox', // demo-futures.kraken.com (можливо, закрито — перевірить npm run check)
     title: 'Kraken Futures',
     ccxt: 'krakenfutures',
     settles: ['USD'], // мультиколатеральні PF_-перпетуали рахуються в USD

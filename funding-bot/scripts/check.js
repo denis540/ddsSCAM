@@ -59,7 +59,7 @@ const timed = async (fn) => {
   for (const id of cfg.exchanges) {
     try {
       const e = new Exchange(id, keys.get(id), { quote: cfg.quote, defaultTakerFee: cfg.defaultTakerFee });
-      if (cfg.sandbox && !e.enableSandbox()) {
+      if (cfg.sandbox && !e.enableSandbox(cfg.testEnv[id])) {
         out(`⚪ ${e.title}: тестової мережі немає (SANDBOX)`);
         continue;
       }

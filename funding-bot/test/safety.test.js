@@ -347,11 +347,25 @@ test('резерв балансу: бот не використовує 20% ві
 
 // ---------- 11. Тестові мережі ----------
 
-test('SANDBOX: тестова мережа є у Binance/Bybit/OKX/BingX/Kraken, немає у HTX/Bitget/KuCoin', () => {
-  const yes = ['binance', 'bybit', 'okx', 'bingx', 'kraken'].map((id) => new Exchange(id, {}).enableSandbox());
-  const no = ['htx', 'bitget', 'kucoin'].map((id) => new Exchange(id, {}).enableSandbox());
-  assert.deepEqual(yes, [true, true, true, true, true]);
-  assert.deepEqual(no, [false, false, false]);
+test('SANDBOX: кожна біржа йде у своє тестове середовище (Bybit — Demo Trading, Bitget — PAPTRADING)', () => {
+  const env = (id, ov) => {
+    const e = new Exchange(id, {});
+    return e.enableSandbox(ov) ? `${e.testEnv} ${JSON.stringify(e.client.urls.api)}` : 'немає';
+  };
+  assert.match(env('binance'), /^sandbox .*testnet\.binancefuture\.com/);
+  assert.match(env('binance', 'demo'), /^demo .*demo-fapi\.binance\.com/);
+  assert.match(env('bybit'), /^demo .*api-demo\./, 'Bybit — Demo Trading, а не Testnet');
+  assert.doesNotMatch(env('bybit'), /api-testnet/);
+  const okx = new Exchange('okx', {});
+  okx.enableSandbox();
+  assert.equal(okx.client.headers['x-simulated-trading'], '1');
+  const bg = new Exchange('bitget', {});
+  assert.ok(bg.enableSandbox());
+  assert.equal(bg.client.options.sandboxMode, true, 'Bitget демо — заголовок PAPTRADING');
+  assert.match(env('bingx'), /open-api-vst/);
+  assert.match(env('kraken'), /demo-futures\.kraken\.com/);
+  assert.equal(env('kucoin'), 'немає');
+  assert.equal(env('htx'), 'немає');
 });
 
 // ---------- Підтвердження нарахування фандінгу ----------

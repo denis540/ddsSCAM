@@ -82,7 +82,7 @@ async function main() {
   for (const id of cfg.exchanges) {
     try {
       const ex = new Exchange(id, keys.get(id), { quote: cfg.quote, defaultTakerFee: cfg.defaultTakerFee });
-      if (cfg.sandbox && !ex.enableSandbox()) {
+      if (cfg.sandbox && !ex.enableSandbox(cfg.testEnv[id])) {
         log.warn(`${ex.title}: тестової мережі немає — у режимі SANDBOX біржу вимкнено`);
         initErrors[id] = 'немає тестової мережі (SANDBOX)';
         continue;
