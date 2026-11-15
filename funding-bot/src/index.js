@@ -182,7 +182,7 @@ async function main() {
     log.info(`Годинник: різниця з біржами ${Math.round(median)} мс (поправку застосовано)`);
     if (Math.abs(median) > cfg.maxClockSkewMs && Date.now() - skewWarnedAt > 6 * HOUR) {
       skewWarnedAt = Date.now();
-      await notify(`⏰ Годинник сервера розходиться з біржами на ${(median / 1000).toFixed(1)} с. Бот враховує поправку, але краще увімкнути синхронізацію часу (NTP) на сервері.`);
+      await notify(`⏰ Годинник комп'ютера розходиться з біржами на ${(median / 1000).toFixed(1)} с. Бот це компенсує сам (поправка оновлюється кожні 10 хв), втручання не потрібне.`);
     }
   };
   await syncClock();
@@ -328,7 +328,8 @@ async function main() {
     if (Object.keys(exchanges).length < Object.keys(all).length && Date.now() - lastInitTry > 5 * MIN) await initPending();
     if (Date.now() - tickersAt > 5 * MIN) await refreshTickers();
     if (Date.now() - coinsLoadedAt > 6 * HOUR) refreshCoins();
-    if (Date.now() - clockSyncedAt > HOUR) await syncClock();
+    // поправку на годинник ПК оновлюємо часто: годинник Windows «пливе», а Bybit відхиляє запити з часом, що випереджає біржу на 1+ с
+    if (Date.now() - clockSyncedAt > 10 * MIN) await syncClock();
     if (Date.now() - statusAt > 5 * MIN) await checkStatuses();
     if (Date.now() - imbalanceAt > 30 * MIN) await checkImbalance().catch((e) => log.debug(`imbalance: ${e.message}`));
     const rates = await fetchAllRates();
