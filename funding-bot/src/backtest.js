@@ -17,13 +17,21 @@ const log = require('./logger');
 const MIN = 60000;
 const roundMin = (ts) => Math.round(ts / MIN) * MIN;
 
-function pickCoins(exchanges, cfg, maxCoins) {
+/**
+ * Які монети перевіряти на історії. Половина — з найбільшою ПОТОЧНОЮ різницею ставок між біржами
+ * (саме там бувають вигідні виплати; топ за обсягом — BTC/ETH — майже ніколи не дає великих ставок),
+ * половина — найбільші за обсягом. Монети з обсягом нижче minVolumeUsdt бот однаково не торгує — їх пропускаємо.
+ */
+function pickCoins(exchanges, cfg, maxCoins, rates) {
   const count = {};
   const vol = {};
+  const minVol = {};
   for (const ex of Object.values(exchanges)) {
     for (const sym of ex.perpSymbols()) {
       count[sym] = (count[sym] || 0) + 1;
-      vol[sym] = (vol[sym] || 0) + ((ex.tickers[sym] && ex.tickers[sym].volumeUsdt) || 0);
+      const v = ex.tickers[sym] && ex.tickers[sym].volumeUsdt;
+      vol[sym] = (vol[sym] || 0) + (v || 0);
+      if (v !== undefined) minVol[sym] = Math.min(minVol[sym] ?? Infinity, v);
     }
   }
   let syms = Object.keys(count).filter((s) => count[s] >= 2);
@@ -31,15 +39,28 @@ function pickCoins(exchanges, cfg, maxCoins) {
   const fixed = cfg.whitelist.length ? cfg.whitelist : cfg.sizeMode === 'coins' ? Object.keys(cfg.coinQty) : [];
   if (fixed.length) syms = syms.filter((s) => fixed.includes(coin(s)));
   syms = syms.filter((s) => !cfg.blacklist.includes(coin(s)));
-  return syms.sort((a, b) => vol[b] - vol[a]).slice(0, maxCoins);
+  if (cfg.minVolumeUsdt > 0) syms = syms.filter((s) => !(minVol[s] < cfg.minVolumeUsdt));
+  const byVolume = [...syms].sort((a, b) => vol[b] - vol[a]);
+  if (!rates) return byVolume.slice(0, maxCoins);
+  const spread = {};
+  for (const s of syms) {
+    const h = Object.values(rates).map((r) => r[s]).filter(Boolean).map((r) => r.rate / (r.intervalH || 8));
+    spread[s] = h.length >= 2 ? Math.max(...h) - Math.min(...h) : 0;
+  }
+  const bySpread = [...syms].sort((a, b) => spread[b] - spread[a]);
+  const out = [];
+  for (let i = 0; out.length < maxCoins && (i < bySpread.length || i < byVolume.length); i++) {
+    for (const s of [bySpread[i], byVolume[i]]) if (s && !out.includes(s) && out.length < maxCoins) out.push(s);
+  }
+  return out;
 }
 
 /**
  * @returns {Promise<object>} статистика; text — готовий звіт
  */
-async function runBacktest({ exchanges, cfg, days = 7, maxCoins = 25, now = Date.now(), onProgress }) {
+async function runBacktest({ exchanges, cfg, days = 7, maxCoins = 25, now = Date.now(), onProgress, rates }) {
   const since = now - days * 86400000;
-  const symbols = pickCoins(exchanges, cfg, maxCoins);
+  const symbols = pickCoins(exchanges, cfg, maxCoins, rates);
   const notional = cfg.sizeMode === 'auto' ? cfg.maxTradeUsdt * cfg.leverage : cfg.positionUsdt;
   const candidates = []; // { ts, symbol, shortEx, longEx, funding, net }
   let done = 0;

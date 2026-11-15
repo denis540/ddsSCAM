@@ -17,6 +17,7 @@ const { planWindows } = require('../src/scanner');
 const { runBacktest } = require('../src/backtest');
 const { sanitize } = require('../src/telegram');
 const { Settings } = require('../src/settings');
+const { CoinRegistry } = require('../src/coins');
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(`--${n}`);
@@ -148,12 +149,34 @@ const timed = async (fn) => {
   }
 
   // 6) Сканер
-  out('\n== 6. Сканер можливостей (за поточними порогами) ==');
+  out('\n== 6. Сканер можливостей (за поточними порогами і фільтрами бота) ==');
   await Promise.all(Object.values(ex).map((e) => e.loadTickers().catch(() => {})));
-  const wins = planWindows(rates, cfg, (id, s) => ex[id].takerFee(s));
-  out(`Вікон, що проходять пороги (фандінг ≥ ${pct(cfg.minFunding, 2)}, чистий ≥ ${pct(cfg.minProfit, 2)}): ${wins.length}`);
-  for (const w of wins.slice(0, 10)) {
-    out(`   ${w.symbol.split('/')[0]}: SHORT ${w.shortEx} / LONG ${w.longEx} о ${new Date(w.startTs).toISOString().slice(11, 16)} UTC — фандінг ${pct(w.funding, 3)}, чистий ${pct(w.net, 3)}${w.estimated ? ' (частково оцінка)' : ''}`);
+  // ті самі фільтри, що й у бота: ризики ринку (лістинг/делістинг/статус), обсяг, однаковість монети за ціною
+  const coins = new CoinRegistry(cfg, null);
+  const marketProblem = (coin, id) => {
+    const sym = `${coin}/USDT:USDT`;
+    const risk = ex[id].marketRisk(sym, cfg);
+    if (risk) return `${id}: ${risk}`;
+    const v = ex[id].tickers[sym] && ex[id].tickers[sym].volumeUsdt;
+    if (cfg.minVolumeUsdt > 0 && v !== undefined && v < cfg.minVolumeUsdt) return `${id}: обсяг за 24 год ${Math.round(v).toLocaleString('uk-UA')} USDT < ${cfg.minVolumeUsdt.toLocaleString('uk-UA')}`;
+    return undefined;
+  };
+  const coinCheck = (coin, a, b, ma, mb) => {
+    const p = marketProblem(coin, a) || marketProblem(coin, b);
+    return p ? { ok: false, reason: p } : coins.check(coin, a, b, ma, mb);
+  };
+  const fee = (id, s) => ex[id].takerFee(s);
+  const raw = planWindows(rates, cfg, fee);
+  const wins = planWindows(rates, cfg, fee, Date.now(), coinCheck);
+  out(`Вікон за порогами (фандінг ≥ ${pct(cfg.minFunding, 2)}, чистий ≥ ${pct(cfg.minProfit, 2)}): ${raw.length}; з них проходять фільтри бота: ${wins.length}`);
+  for (const w of raw.slice(0, 15)) {
+    const coin = w.symbol.split('/')[0];
+    const r = rates[w.shortEx][w.symbol];
+    const l = rates[w.longEx][w.symbol];
+    const chk = coinCheck(coin, w.shortEx, w.longEx, r && r.mark, l && l.mark);
+    out(`   ${chk.ok ? '✅' : '⛔'} ${coin}: SHORT ${w.shortEx} ${pct(w.shortRate, 3)}/${w.shortIntervalH}h, LONG ${w.longEx} ${pct(w.longRate, 3)}/${w.longIntervalH}h, ` +
+      `виплати ${new Date(w.startTs).toISOString().slice(11, 16)}${w.endTs !== w.startTs ? `–${new Date(w.endTs).toISOString().slice(11, 16)}` : ''} UTC — фандінг ${pct(w.funding, 3)}, чистий ${pct(w.net, 3)}${w.estimated ? ' (частково оцінка)' : ''}` +
+      `${chk.ok ? '' : `\n        не торгується: ${chk.reason}`}`);
   }
 
   // 7) Самоперевірка (лише з --selftest)
@@ -174,7 +197,7 @@ const timed = async (fn) => {
   if (days > 0) {
     out(`\n== 8. Перевірка на історії за ${days} дн ==`);
     try {
-      const r = await runBacktest({ exchanges: ex, cfg, days, maxCoins: arg('coins', 20), onProgress: (d, n) => process.stdout.write(`\r   ${d}/${n} монет`) });
+      const r = await runBacktest({ exchanges: ex, cfg, days, maxCoins: arg('coins', 40), rates, onProgress: (d, n) => process.stdout.write(`\r   ${d}/${n} монет`) });
       process.stdout.write('\n');
       out(r.text);
     } catch (err) {

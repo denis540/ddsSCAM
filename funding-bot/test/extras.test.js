@@ -154,3 +154,23 @@ test('збереження стану не падає, навіть якщо ф�
     fs.renameSync = orig;
   }
 });
+
+test('перевірка на історії бере монети з найбільшою різницею ставок, а не лише найбільші за обсягом', async () => {
+  const { pickCoins } = require('../src/backtest');
+  const mk = (vols) => ({
+    perpSymbols: () => Object.keys(vols),
+    tickers: Object.fromEntries(Object.entries(vols).map(([s, v]) => [s, { volumeUsdt: v }])),
+  });
+  const S = (c) => `${c}/USDT:USDT`;
+  const vols = { [S('BTC')]: 9e9, [S('ETH')]: 8e9, [S('SOL')]: 7e9, [S('SOPH')]: 5e6, [S('TINY')]: 1e5 };
+  const exchanges = { a: mk(vols), b: mk(vols) };
+  const r = (rate) => ({ rate, intervalH: 8 });
+  const rates = {
+    a: { [S('BTC')]: r(0.0001), [S('ETH')]: r(0.0001), [S('SOL')]: r(0.0001), [S('SOPH')]: r(-0.005), [S('TINY')]: r(-0.03) },
+    b: { [S('BTC')]: r(0.0001), [S('ETH')]: r(0.0001), [S('SOL')]: r(0.0001), [S('SOPH')]: r(0.005), [S('TINY')]: r(0.03) },
+  };
+  const cfg = { whitelist: [], blacklist: [], sizeMode: 'auto', coinQty: {}, minVolumeUsdt: 1e6 };
+  const picked = pickCoins(exchanges, cfg, 2, rates);
+  assert.deepEqual(picked, [S('SOPH'), S('BTC')], 'SOPH — за різницею ставок, BTC — за обсягом; TINY відсіяно за малим обсягом');
+  assert.deepEqual(pickCoins(exchanges, cfg, 2), [S('BTC'), S('ETH')], 'без ставок — як раніше, за обсягом');
+});

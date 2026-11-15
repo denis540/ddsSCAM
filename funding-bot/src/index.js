@@ -239,7 +239,7 @@ async function main() {
     await tg.start({
       cfg, settings, state, trader, keys, all, exchanges, initErrors, coins, guard, reconciler, marketProblem,
       checkPositionMode, applySelfTest, onKeyAdded: (ex) => prepareKeyedExchange(ex),
-      runBacktest: (days) => runBacktest({ exchanges, cfg, days, maxCoins: 25 }),
+      runBacktest: (days) => runBacktest({ exchanges, cfg, days, maxCoins: 40, rates: lastRates }),
       getRates: () => lastRates,
       getOpps: () => lastWindows,
       getLastScanAt: () => lastScanAt,
