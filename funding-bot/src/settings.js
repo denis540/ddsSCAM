@@ -16,7 +16,7 @@ const SCHEMA = {
   settledelay: { label: 'Не закриватись після виплати, с', field: 'settleDelaySec', type: 'int', min: 1, max: 600, desc: 'Раніше цього після виплати бот не закривається (щоб виплата точно відбулась). Фактичний початок пошуку виходу — більше з цього і «Вихід після виплати»' },
   converge: { label: 'Ціни зійшлися при', field: 'convergePct', type: 'pct', min: 0, desc: 'Ціни зійшлися, якщо різниця між біржами ≤ %' },
   earlyexit: { label: 'Ранній вихід', field: 'earlyExit', type: 'bool', desc: 'Вийти ДО виплати, якщо прибуток від цін уже більший за фандінг (on/off)' },
-  maxwindow: { label: 'Макс. вікно, год', field: 'maxWindowHours', type: 'num', min: 0, max: 24, desc: 'Макс. годин між першою і останньою виплатою у вікні (0 = лише одночасні/одна виплата)' },
+  maxwindow: { label: 'Макс. вікно, год', field: 'maxWindowHours', type: 'num', min: 0, max: 24, desc: '0 — кожна угода під ОДНУ виплату: вхід перед нею, вихід одразу після (рекомендовано). >0 — дозволити тримати позицію через кілька виплат до N годин' },
   estimated: { label: 'Оціночні виплати', field: 'allowEstimated', type: 'bool', desc: 'Враховувати наступні виплати за поточною ставкою (on/off)' },
   sizemode: { label: 'Режим розміру', field: 'sizeMode', type: 'enum', values: ['auto', 'coins', 'usdt'], desc: 'auto — бот сам рахує максимум за стаканами обох бірж і плечем, не більше maxtrade × плече; coins — фіксована кількість монет; usdt — фіксована сума' },
   maxtrade: { label: 'Сума на угоду (маржа)', field: 'maxTradeUsdt', type: 'num', min: 1, desc: 'Ваші гроші на 1 угоду на КОЖНІЙ біржі, USDT. Позиція = сума × плече, але не більше, ніж витримують стакани обох бірж' },

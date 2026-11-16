@@ -105,3 +105,13 @@ test('вікно не починається з виплати проти нас
   assert.ok(mine.every((w) => w.startTs === T + 2 * M + 4 * H), 'вхід лише перед 18:00, не о 14:00');
   assert.ok(near(mine[0].funding, 0.0113 - 0.0032));
 });
+
+test('MAX_WINDOW_HOURS=0: кожна угода лише під одну виплату (KAVA: вхід перед 18:00, без 14:00)', () => {
+  const c0 = { ...cfg, maxWindowHours: 0 };
+  const wins = planWindows({ binance: { [S]: r(-0.0032, T + 2 * M, 4) }, bybit: { [S]: r(-0.0113, T + 2 * M + 4 * H, 8) } }, c0, undefined, T);
+  assert.ok(wins.length);
+  for (const w of wins) assert.equal(w.startTs, w.endTs, 'вікно — одна мить виплати');
+  const w = best(wins);
+  assert.equal(w.startTs, T + 2 * M + 4 * H);
+  assert.ok(near(w.funding, 0.0113 - 0.0032)); // о 18:00 обидві: отримуємо 1.13%, платимо 0.32%
+});

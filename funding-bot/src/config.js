@@ -69,7 +69,7 @@ const config = {
   minProfit: num('MIN_PROFIT_PCT', 0.05) / 100, // мін. чистий профіт за вікно після 4 комісій, %
   entryBeforeSec: num('ENTRY_BEFORE_SEC', 120), // заходимо приблизно за стільки секунд до виплати
   entryMinSec: num('ENTRY_MIN_SEC', 20), // пізніше цього вже не заходимо (ризик не встигнути)
-  maxWindowHours: num('MAX_WINDOW_HOURS', 8), // макс. тривалість вікна між першою і останньою виплатою
+  maxWindowHours: num('MAX_WINDOW_HOURS', 0), // 0 = кожна угода під ОДНУ виплату (вхід перед нею, вихід одразу після); >0 — можна тримати через кілька виплат
   lookaheadHours: num('LOOKAHEAD_HOURS', 8), // на скільки годин уперед показувати можливості (/top)
   allowEstimated: bool('ALLOW_ESTIMATED', true), // враховувати наступні виплати за поточною ставкою
   // true: несприятлива різниця цін на вході — витрата (вхід лише якщо фандінг її покриває).
