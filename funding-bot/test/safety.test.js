@@ -499,3 +499,25 @@ test('самоперевірка: немає права на торгівлю �
   assert.match(r.checks.find((c) => c.name.startsWith('права')).info, /права на торгівлю є/);
   a.client.createOrder = orig;
 });
+
+test('вхід з несприятливою різницею цін: сходження до 0 — збиток, тож чекаємо повернення до рівня входу', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup({ maxEntryBasisPct: 0.005 });
+  a.client.price = 99.7; // біржа шорту дешевша на ~0.3%: продаємо дешевше, ніж купуємо
+  assert.ok(await trader.tryOpen(await window()));
+  const pos = state.positions[0];
+  assert.ok(pos.entryBasis < -0.002, String(pos.entryBasis));
+  a.client.funding = [{ symbol: SYM, timestamp: Date.now() + 100000, amount: 0.5 }];
+  const b = trader.ex.b;
+  b.client.funding = [{ symbol: SYM, timestamp: Date.now() + 100000, amount: -0.1 }];
+  a.client.price = 100; // після виплати ціни «зійшлися» до 0 — для цієї угоди це −0.3%
+  at(115000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'не фіксуємо збиток на сходженні');
+  a.client.price = 99.7; // різниця повернулась до рівня входу
+  at(130000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  const exit = msgs.find((m) => m.includes('ВИХІД'));
+  assert.match(exit, /ціни зійшлися .*на вході була -0\.3/);
+  assert.match(exit, /Різниця цін між біржами: на вході -0\.3\d*%, на виході -0\.3/);
+});

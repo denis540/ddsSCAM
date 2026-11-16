@@ -863,8 +863,11 @@ class Trader {
             continue;
           }
           const q = await this.exitQuote(pos);
-          if (q && q.exitBasis <= this.cfg.convergePct) {
-            await this.closePair(pos, `ціни зійшлися (різниця ${pct(q.exitBasis)}) після виплати`, q);
+          // Прибуток від цін = різниця на вході − різниця на виході. «Зійшлися» = різниця ≈ 0 І не гірша, ніж була на вході:
+          // якщо зайшли з несприятливою різницею (−0.3%), її сходження до 0 — це збиток, тоді чекаємо, поки повернеться до рівня входу
+          const notWorse = q && (pos.entryBasis ?? 0) - q.exitBasis >= -this.cfg.convergePct;
+          if (q && q.exitBasis <= this.cfg.convergePct && notWorse) {
+            await this.closePair(pos, `ціни зійшлися (різниця ${pct(q.exitBasis)}, на вході була ${pct(pos.entryBasis ?? 0)}) після виплати`, q);
             continue;
           }
           if (q && now >= pos.exitAt) {
@@ -1092,6 +1095,7 @@ class Trader {
         (paidEvents.length
           ? `Отримані виплати:\n${paidEvents.map((e) => `   ${clock(e.ts, this.cfg.timezone)} ${e.ex} ${e.side.toUpperCase()} ${pct(e.rate, 4)} → ${sgn(e.amount)}`).join('\n')}\n`
           : 'Виплат не було\n') +
+        `Різниця цін між біржами: на вході ${pct(pos.entryBasis ?? 0)}, на виході ${pct((exitS - exitL) / exitL)}\n` +
         `Фандінг: ${sgn(pos.fundingAccrued)} (${fundingSource}) | Різниця цін: ${sgn(pricePnl)} | Комісії: −${fmt(pos.feesPaid + closeFees)}\n` +
         `${pnl >= 0 ? '💰' : '🔻'} PnL угоди: ${sgn(pnl)} ${this.cfg.quote}\n` +
         `Загальний PnL: ${sgn(s.realizedPnl)} ${this.cfg.quote} (${s.trades} угод)`
