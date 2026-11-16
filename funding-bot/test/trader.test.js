@@ -225,7 +225,8 @@ test('сповіщення: ордери, виплати, PnL угоди і за
   assert.match(msgs[0], /ВХІД ETH/);
   assert.match(msgs[0], /SELL 1 ETH @ 99\.99 на a/);
   assert.match(msgs[0], /BUY 1 ETH \(10 контр\.\) @ 100\.01 на b/);
-  assert.match(msgs[0], /a SHORT: ставка 3\.0000%/);
+  assert.match(msgs[0], /a SHORT: ✅ отримуємо .*ставка 3\.0000%/);
+  assert.match(msgs[0], /План виходу: позиція ВІДКРИТА/);
   assert.match(msgs[0], /Очікуваний фандінг: \+2%/);
   assert.match(msgs[1], /ВИХІД/);
   assert.match(msgs[1], /Отримані виплати/);

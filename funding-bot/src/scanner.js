@@ -145,6 +145,9 @@ function planWindows(ratesByExchange, cfg, takerFee = () => cfg.defaultTakerFee,
             if (!cfg.allowEstimated && w.estimated) continue;
             if (w.funding < cfg.minFunding || w.net < cfg.minProfit) continue;
             if (w.basis < -cfg.maxEntryBasisPct) continue;
+            // Вікно, що ПОЧИНАЄТЬСЯ з виплати проти нас, гірше за вікно, яке стартує пізніше (зайти можна і пізніше):
+            // зайвий мінус і години ризику. Напр. 14:00 платимо 0.3%, 18:00 отримуємо 1.1% — заходимо лише перед 18:00.
+            if (times[j] > times[i] && sumFunding(w.events.filter((e) => e.ts === times[i])) <= 0) continue;
             if (!best || w.net > best.net) best = w;
           }
           if (best) out.push(best);

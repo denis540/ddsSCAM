@@ -96,3 +96,12 @@ test('parseIntervalHours', () => {
   assert.equal(parseIntervalHours({ fundingTimestamp: 1e12, nextFundingTimestamp: 1e12 + 2 * 3600e3 }), 2);
   assert.equal(parseIntervalHours({}), 8);
 });
+
+test('вікно не починається з виплати проти нас: KAVA binance −0.32%/4h (шорт платить) о 14:00, bybit −1.13%/8h о 18:00', () => {
+  // шорт binance о 14:00 і 18:00 платить 0.32%, лонг bybit о 18:00 отримує 1.13%
+  const wins = planWindows({ binance: { [S]: r(-0.0032, T + 2 * M, 4) }, bybit: { [S]: r(-0.0113, T + 2 * M + 4 * H, 8) } }, cfg, undefined, T);
+  const mine = wins.filter((w) => w.shortEx === 'binance' && w.longEx === 'bybit');
+  assert.ok(mine.length, 'вікно перед 18:00 лишається');
+  assert.ok(mine.every((w) => w.startTs === T + 2 * M + 4 * H), 'вхід лише перед 18:00, не о 14:00');
+  assert.ok(near(mine[0].funding, 0.0113 - 0.0032));
+});

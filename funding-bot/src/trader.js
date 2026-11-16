@@ -199,7 +199,21 @@ class Trader {
     const usd = mark ? ` ≈ ${sgn(c * base * mark)} ${this.cfg.quote}` : '';
     const left = ev.ts - this.now();
     const when = left > 0 ? `через ${duration(left)}` : 'виплачено';
-    return `   ${clock(ev.ts, this.cfg.timezone)} ${ev.ex} ${sideTxt}: ставка ${pct(ev.rate, 4)}${ev.est ? ' (оцінка)' : ''} → ${sgn(c * 100, 4)}%${usd} [${when}]`;
+    const dir = c > 0 ? '✅ отримуємо' : c < 0 ? '❗ платимо' : '—';
+    return `   ${clock(ev.ts, this.cfg.timezone)} ${ev.ex} ${sideTxt}: ${dir} ${sgn(c * 100, 4)}%${usd} (ставка ${pct(ev.rate, 4)}${ev.est ? ', оцінка' : ''}) [${when}]`;
+  }
+
+  /** Зрозумілий план виходу для повідомлення про вхід. */
+  exitPlanText(pos) {
+    const tz = this.cfg.timezone;
+    const wait = this.cfg.maxConvergeWaitMin || 0;
+    return (
+      `📌 План виходу: позиція ВІДКРИТА і тримається до ${clock(pos.endTs, tz)}` +
+      `${pos.events.length > 1 ? ' — щоб отримати всі виплати вікна' : ''}.\n` +
+      `   З ${clock(pos.exitAt, tz)} шукаю вихід кожні ${this.cfg.tickSec || 5} с: ціни зійшлися / різниця не гірша, ніж на вході, або угода в плюсі.` +
+      `${wait ? ` Якщо в мінусі — чекаю до ${wait} хв.` : ''}\n` +
+      `   Раніше закрию, лише якщо: ціни зійдуться і це вигідніше за решту фандінгу, ставка розвернеться проти нас або буде ризик ліквідації.`
+    );
   }
 
   windowKey(w) {
@@ -445,8 +459,9 @@ class Trader {
       this.state.addPosition(pos);
       const notional = pos.base * mid;
       await this.notify(
-        `✅ ВХІД ${symbol}${this.paper ? ' [PAPER]' : ''} — під фандінг о ${clock(pos.startTs, this.cfg.timezone)}` +
-          `${pos.endTs !== pos.startTs ? `–${clock(pos.endTs, this.cfg.timezone)}` : ''}\n` +
+        `✅ ВХІД ${symbol}${this.paper ? ' [PAPER]' : ''} — ${pos.endTs !== pos.startTs
+          ? `тримаю ${duration(pos.endTs - now)}, до останньої виплати о ${clock(pos.endTs, this.cfg.timezone)} (виплат у вікні: ${pos.events.length})`
+          : `під виплату о ${clock(pos.startTs, this.cfg.timezone)}`}\n` +
           `${this.orderLine('sell', shortEx, symbol, pos.base, pos.short.contracts, pos.short.entry, legs.shortFee, legs.shortType)}\n` +
           `${this.orderLine('buy', longEx, symbol, pos.base, pos.long.contracts, pos.long.entry, legs.longFee, legs.longType)}\n` +
           `Кількість: ${fmt(pos.base, 8)} ${coinOf(symbol)} — однакова на обох біржах (крок ${fmt(cap.step, 8)})\n` +
@@ -457,7 +472,7 @@ class Trader {
           `Очікуваний фандінг: ${sgn(fresh.funding * 100, 4)}% ≈ ${sgn(fresh.funding * notional)} ${this.cfg.quote}\n` +
           `Різниця цін на вході: ${pct(basis)}, комісії (вхід+вихід) ≈ ${fmt(fees * notional)}\n` +
           `Чистий очікуваний: ${sgn(net * 100, 3)}% ≈ ${sgn(net * notional)} ${this.cfg.quote}\n` +
-          `Вихід: ~${clock(pos.exitAt, this.cfg.timezone)} або раніше, коли ціни зійдуться`
+          this.exitPlanText(pos)
       );
       this.skipped.set(key, win.startTs);
       if (!this.paper && this.cfg.protectStops) await this.placeProtection(pos);
