@@ -77,8 +77,8 @@ const config = {
   maxAbsFundingRate: num('MAX_ABS_FUNDING_RATE_PCT', 10) / 100, // відсікаємо явні аномалії
 
   // Вихід
-  exitAfterSec: num('EXIT_AFTER_SEC', 120), // вихід приблизно через стільки секунд після останньої виплати
-  settleDelaySec: num('SETTLE_DELAY_SEC', 10), // раніше цього після виплати не закриваємось (щоб біржа точно нарахувала)
+  exitAfterSec: num('EXIT_AFTER_SEC', 5), // вихід приблизно через стільки секунд після останньої виплати
+  settleDelaySec: num('SETTLE_DELAY_SEC', 5), // раніше цього після виплати не закриваємось (щоб біржа точно нарахувала)
   convergePct: num('CONVERGE_PCT', 0.05) / 100, // ціни «зійшлися», якщо різниця між біржами ≤ X%
   earlyExit: bool('EARLY_EXIT', true), // вийти ще ДО виплати, якщо прибуток від цін уже більший за очікуваний фандінг
   maxConvergeWaitMin: num('MAX_CONVERGE_WAIT_MIN', 30), // після виплати чекати сходження цін до N хв замість виходу в мінус

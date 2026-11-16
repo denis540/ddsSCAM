@@ -87,6 +87,20 @@ test('ціни не зійшлися — вихід через exitAfterSec пі
   assert.match(msgs.at(-1), /після виплати/);
 });
 
+test('вихід через 5 с після виплати: ціни не зійшлися, але угода в плюсі — фіксує одразу', async () => {
+  const { a, state, trader, rates, window, at, msgs } = await setup({ exitAfterSec: 5, settleDelaySec: 5, maxConvergeWaitMin: 30 });
+  assert.ok(await trader.tryOpen(await window()));
+  a.client.price = 100.3; // різниця цін не зійшлася, але фандінг 2% її покриває
+  at(100000 + 4000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 1, 'раніше 5 с після виплати не закривається');
+  at(100000 + 6000);
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /угода в плюсі/);
+  assert.ok(state.data.closed[0].pnl > 0);
+});
+
 test('різний час: виплата лише OKX через 100 с, Binance через 1 год — вихід після OKX', async () => {
   const { T0, state, trader, rates, window, at } = await setup({}, {}, { next: Date.now() + 3600000 });
   const w = await window();
