@@ -1,5 +1,10 @@
 'use strict';
 
+/** Несприятлива різниця цін як витрата (≤ 0), або 0, якщо BASIS_COST=false. */
+function spreadCost(basis, cfg) {
+  return cfg && cfg.basisCost === false ? 0 : Math.min(basis, 0);
+}
+
 /**
  * Стратегія «під конкретну виплату фандінгу».
  *
@@ -61,7 +66,7 @@ function buildWindow({ symbol, shortEx, longEx, s, l, startTs, endTs, now, cfg, 
   if (!events.length || events[0].ts !== startTs) return undefined;
   const funding = sumFunding(events);
   const basis = s.mark && l.mark ? (s.mark - l.mark) / l.mark : 0;
-  const net = funding - fees + Math.min(basis, 0);
+  const net = funding - fees + spreadCost(basis, cfg);
   return {
     symbol,
     shortEx,
@@ -158,4 +163,4 @@ function dueWindows(windows, cfg, now = Date.now()) {
   });
 }
 
-module.exports = { planWindows, buildWindow, dueWindows, upcomingEvents, sumFunding, contrib };
+module.exports = { spreadCost, planWindows, buildWindow, dueWindows, upcomingEvents, sumFunding, contrib };

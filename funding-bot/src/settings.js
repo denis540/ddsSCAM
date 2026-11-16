@@ -27,6 +27,7 @@ const SCHEMA = {
   marginmode: { label: 'Режим маржі', field: 'marginMode', type: 'enum', values: ['isolated', 'cross'], desc: 'Режим маржі' },
   maxpos: { label: 'Макс. позицій', field: 'maxPositions', type: 'int', min: 0, max: 100, desc: 'Макс. одночасно відкритих пар' },
   basis: { label: 'Макс. різниця цін на вході', field: 'maxEntryBasisPct', type: 'pct', min: 0, desc: 'Макс. несприятлива різниця цін між біржами на вході, %' },
+  basiscost: { label: 'Різниця цін на вході — витрата', field: 'basisCost', type: 'bool', desc: 'on — вхід лише якщо фандінг покриває несприятливу різницю цін (надійніше); off — не віднімати її: бот заходить, якщо фандінг > комісій + поріг, і розраховує вийти приблизно на тій самій різниці (ризикованіше; обмеження — «Макс. різниця цін на вході»)' },
   slippage: { label: 'Макс. слипедж', field: 'maxSlippagePct', type: 'pct', min: 0, desc: 'Макс. слипедж по стакану, %' },
   liqclose: { label: 'Закрити при % шляху до ліквідації', field: 'liqClosePct', type: 'pct', min: 10, max: 95, desc: 'Бот закриває пару, коли ціна пройшла стільки % шляху від входу до ліквідації будь-якої ноги' },
   protect: { label: 'Стопи на біржах', field: 'protectStops', type: 'bool', desc: 'Захисні стоп-ордери на самих біржах — спрацюють, навіть якщо бот впав (on/off)' },

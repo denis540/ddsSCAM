@@ -1,7 +1,7 @@
 'use strict';
 
 const log = require('./logger');
-const { buildWindow, contrib } = require('./scanner');
+const { buildWindow, contrib, spreadCost } = require('./scanner');
 const { clock, duration, nowSynced } = require('./time');
 const { commonStep, floorToStep } = require('./exchange');
 
@@ -272,7 +272,7 @@ class Trader {
         const pL = vwap(obL.asks, b, uL);
         if (!pS || !pL) return false;
         const basis = (pS - pL) / pL;
-        return basis >= -cfg.maxEntryBasisPct && funding - fees + Math.min(basis, 0) >= cfg.minProfit;
+        return basis >= -cfg.maxEntryBasisPct && funding - fees + spreadCost(basis, cfg) >= cfg.minProfit;
       };
       if (base > 0 && !okAt(base)) {
         let lo = 0;
@@ -291,12 +291,12 @@ class Trader {
     {
       const fees = 2 * (S.takerFee(symbol) + L.takerFee(symbol));
       const basis0 = (bidS - askL) / askL; // найкращі ціни: продаємо на S по bid, купуємо на L по ask
-      const net0 = funding !== undefined ? funding - fees + Math.min(basis0, 0) : undefined;
+      const net0 = funding !== undefined ? funding - fees + spreadCost(basis0, cfg) : undefined;
       if (basis0 < -cfg.maxEntryBasisPct) {
         zeroReason = `ціна на ${shortEx} (${fmt(bidS, 8)}) нижча, ніж на ${longEx} (${fmt(askL, 8)}), на ${pct(-basis0)} — допуск різниці цін проти нас ${pct(cfg.maxEntryBasisPct)}` +
-          (net0 !== undefined && net0 < cfg.minProfit ? `; і навіть з більшим допуском: фандінг ${pct(funding)} − комісії ${pct(fees)} − різниця цін ${pct(-basis0)} = ${pct(net0)} < порогу ${pct(cfg.minProfit)}` : '');
+          (net0 !== undefined && net0 < cfg.minProfit && cfg.basisCost !== false ? `; і навіть з більшим допуском: фандінг ${pct(funding)} − комісії ${pct(fees)} − різниця цін ${pct(-basis0)} = ${pct(net0)} < порогу ${pct(cfg.minProfit)}` : '');
       } else if (net0 !== undefined && net0 < cfg.minProfit) {
-        zeroReason = `чистий прибуток навіть на мінімальному обсязі ${pct(net0)} (фандінг ${pct(funding)} − комісії ${pct(fees)}${basis0 < 0 ? ` − різниця цін ${pct(-basis0)}` : ''}) < порогу ${pct(cfg.minProfit)}`;
+        zeroReason = `чистий прибуток навіть на мінімальному обсязі ${pct(net0)} (фандінг ${pct(funding)} − комісії ${pct(fees)}${basis0 < 0 && cfg.basisCost !== false ? ` − різниця цін ${pct(-basis0)}` : ''}) < порогу ${pct(cfg.minProfit)}`;
       }
     }
     // Однакова кількість на обох біржах — кратна спільному кроку лотів
@@ -376,7 +376,7 @@ class Trader {
       }
       const basis = (pxS - pxL) / pxL; // >0: шортимо дорожче, ніж купуємо
       if (basis < -this.cfg.maxEntryBasisPct) return skip(`несприятлива різниця цін ${pct(basis)}`);
-      const net = fresh.funding - fees + Math.min(basis, 0);
+      const net = fresh.funding - fees + spreadCost(basis, this.cfg);
       if (net < this.cfg.minProfit) return skip(`чистий профіт ${pct(net)} < ${pct(this.cfg.minProfit)}`);
 
       const { leverage } = cap; // однакове на обох біржах
@@ -869,7 +869,8 @@ class Trader {
           // якщо зайшли з несприятливою різницею (−0.3%), її сходження до 0 — це збиток, тоді чекаємо, поки повернеться до рівня входу
           const notWorse = q && (pos.entryBasis ?? 0) - q.exitBasis >= -this.cfg.convergePct;
           if (q && q.exitBasis <= this.cfg.convergePct && notWorse) {
-            await this.closePair(pos, `ціни зійшлися (різниця ${pct(q.exitBasis)}, на вході була ${pct(pos.entryBasis ?? 0)}) після виплати`, q);
+            const what = Math.abs(q.exitBasis) <= this.cfg.convergePct ? 'ціни зійшлися' : 'різниця цін повернулась до рівня входу';
+            await this.closePair(pos, `${what} (різниця ${pct(q.exitBasis)}, на вході була ${pct(pos.entryBasis ?? 0)}) після виплати`, q);
             continue;
           }
           if (q && now >= pos.exitAt) {

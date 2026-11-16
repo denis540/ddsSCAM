@@ -72,6 +72,9 @@ const config = {
   maxWindowHours: num('MAX_WINDOW_HOURS', 8), // макс. тривалість вікна між першою і останньою виплатою
   lookaheadHours: num('LOOKAHEAD_HOURS', 8), // на скільки годин уперед показувати можливості (/top)
   allowEstimated: bool('ALLOW_ESTIMATED', true), // враховувати наступні виплати за поточною ставкою
+  // true: несприятлива різниця цін на вході — витрата (вхід лише якщо фандінг її покриває).
+  // false: не віднімати її при вході — бот розраховує вийти приблизно на тій самій різниці (ризикованіше)
+  basisCost: bool('BASIS_COST', true),
   maxEntryBasisPct: num('MAX_ENTRY_BASIS_PCT', 0.15) / 100, // макс. несприятлива різниця цін між біржами
   maxSlippagePct: num('MAX_SLIPPAGE_PCT', 0.1) / 100,
   maxAbsFundingRate: num('MAX_ABS_FUNDING_RATE_PCT', 10) / 100, // відсікаємо явні аномалії

@@ -101,6 +101,26 @@ test('вихід через 5 с після виплати: ціни не зій
   assert.ok(state.data.closed[0].pnl > 0);
 });
 
+test('BASIS_COST=false: заходить попри несприятливу різницю цін (у межах допуску), виходить, коли разом у плюсі', async () => {
+  const over = { maxEntryBasisPct: 0.005, minProfit: 0.0175, exitAfterSec: 5, settleDelaySec: 5, maxConvergeWaitMin: 30 };
+  {
+    const { a, trader, window } = await setup(over);
+    a.client.price = 99.7; // на біржі шорту ціна нижча на ~0.3%
+    const w = await window();
+    assert.ok(!w || !(await trader.tryOpen(w)), 'за замовчуванням різниця цін — витрата: 2% − 0.2% − 0.3% < 1.75%');
+  }
+  const { a, state, trader, window, rates, at, msgs } = await setup({ ...over, basisCost: false });
+  a.client.price = 99.7;
+  assert.ok(await trader.tryOpen(await window()));
+  const pos = state.positions[0];
+  assert.ok(pos.entryBasis < -0.002, String(pos.entryBasis));
+  at(100000 + 6000); // різниця цін та сама, що на вході — фандінг у кишені
+  await trader.manage(await rates());
+  assert.equal(state.positions.length, 0);
+  assert.match(msgs.at(-1), /на вході була/);
+  assert.ok(state.data.closed[0].pnl > 0);
+});
+
 test('різний час: виплата лише OKX через 100 с, Binance через 1 год — вихід після OKX', async () => {
   const { T0, state, trader, rates, window, at } = await setup({}, {}, { next: Date.now() + 3600000 });
   const w = await window();
