@@ -293,7 +293,8 @@ class Trader {
       const basis0 = (bidS - askL) / askL; // найкращі ціни: продаємо на S по bid, купуємо на L по ask
       const net0 = funding !== undefined ? funding - fees + Math.min(basis0, 0) : undefined;
       if (basis0 < -cfg.maxEntryBasisPct) {
-        zeroReason = `ціна на ${shortEx} (${fmt(bidS, 8)}) нижча, ніж на ${longEx} (${fmt(askL, 8)}), на ${pct(-basis0)} — допуск різниці цін проти нас ${pct(cfg.maxEntryBasisPct)}`;
+        zeroReason = `ціна на ${shortEx} (${fmt(bidS, 8)}) нижча, ніж на ${longEx} (${fmt(askL, 8)}), на ${pct(-basis0)} — допуск різниці цін проти нас ${pct(cfg.maxEntryBasisPct)}` +
+          (net0 !== undefined && net0 < cfg.minProfit ? `; і навіть з більшим допуском: фандінг ${pct(funding)} − комісії ${pct(fees)} − різниця цін ${pct(-basis0)} = ${pct(net0)} < порогу ${pct(cfg.minProfit)}` : '');
       } else if (net0 !== undefined && net0 < cfg.minProfit) {
         zeroReason = `чистий прибуток навіть на мінімальному обсязі ${pct(net0)} (фандінг ${pct(funding)} − комісії ${pct(fees)}${basis0 < 0 ? ` − різниця цін ${pct(-basis0)}` : ''}) < порогу ${pct(cfg.minProfit)}`;
       }
