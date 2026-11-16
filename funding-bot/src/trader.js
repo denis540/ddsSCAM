@@ -337,7 +337,8 @@ class Trader {
       // 1) Свіжі ставки прямо перед входом — прогнозна ставка може змінитися аж до виплати
       const [rS, rL] = await Promise.all([S.fetchFundingRate(symbol), L.fetchFundingRate(symbol)]);
       // фактичні комісії вашого акаунта (VIP-рівень, знижки), а не базові
-      if (!this.paper) await Promise.all([S.ensureFee(symbol), L.ensureFee(symbol)]);
+      // (і в paper, якщо є ключі: інакше paper-тест показує кращий результат, ніж буде в live)
+      await Promise.all([S.ensureFee(symbol), L.ensureFee(symbol)]);
       const fees = 2 * (S.takerFee(symbol) + L.takerFee(symbol));
       const fresh = rS && rL && buildWindow({ symbol, shortEx, longEx, s: rS, l: rL, startTs: win.startTs, endTs: win.endTs, now, cfg: this.cfg, fees });
       if (!fresh) return skip('час виплати змінився');

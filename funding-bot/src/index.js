@@ -108,9 +108,10 @@ async function main() {
    * підключилась пізніше, і після додавання ключа через Telegram — щоб жодна біржа не торгувала без перевірки.
    */
   const prepareKeyedExchange = async (ex, { quiet = false } = {}) => {
-    if (cfg.mode !== 'live' || !ex.hasKeys || !ex.ready) return;
+    if (!ex.hasKeys || !ex.ready) return;
+    // фактичні комісії акаунта — і в paper теж, щоб результат paper-тесту відповідав live
     await ex.loadAccountFees().catch((e) => log.debug(`${ex.id} fees: ${e.message}`));
-    if (!cfg.selfTestOnStart) return;
+    if (cfg.mode !== 'live' || !cfg.selfTestOnStart) return;
     const avoid = state.positions.filter((p) => p.shortEx === ex.id || p.longEx === ex.id).map((p) => p.symbol);
     const r = await ex.runSelfTest({ avoid }).catch((e) => ({ ok: false, checks: [{ name: 'самоперевірка', ok: false, critical: true, info: e.message }] }));
     applySelfTest(ex, r);
@@ -189,10 +190,10 @@ async function main() {
 
   // ---- Live: фактичні комісії акаунта і самоперевірка кожної біржі з ключем (і тих, що підключаться пізніше) ----
   state.pendingNotes = [];
-  if (cfg.mode === 'live' && !scanOnly) {
+  if (!scanOnly) {
     const keyed = Object.values(exchanges).filter((e) => e.hasKeys);
     await Promise.all(keyed.map((ex) => prepareKeyedExchange(ex, { quiet: true })));
-    log.info(`Самоперевірка: ${keyed.map((ex) => `${ex.id} ${ex.selfTest ? (ex.selfTest.ok ? 'ok' : 'FAIL') : '—'}`).join(', ')}`);
+    if (cfg.mode === 'live') log.info(`Самоперевірка: ${keyed.map((ex) => `${ex.id} ${ex.selfTest ? (ex.selfTest.ok ? 'ok' : 'FAIL') : '—'}`).join(', ')}`);
   }
 
   // ---- Перевірка монет: адреси контрактів + ризики ринку + обсяги ----
