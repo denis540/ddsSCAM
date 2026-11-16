@@ -518,6 +518,6 @@ test('вхід з несприятливою різницею цін: сходж
   await trader.manage(await rates());
   assert.equal(state.positions.length, 0);
   const exit = msgs.find((m) => m.includes('ВИХІД'));
-  assert.match(exit, /ціни зійшлися .*на вході була -0\.3/);
+  assert.match(exit, /різниця цін повернулась до рівня входу .*на вході була -0\.3/);
   assert.match(exit, /Різниця цін між біржами: на вході -0\.3\d*%, на виході -0\.3/);
 });
