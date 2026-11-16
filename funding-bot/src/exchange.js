@@ -735,7 +735,7 @@ class Exchange {
     await step('баланс', async () => {
       const b = await this.balanceSummary();
       if (!(b.free > 0)) throw new Error(`вільний баланс ${b.free} ${b.currency}`);
-      return `${b.free.toFixed(2)} ${b.currency}`;
+      return `${b.free >= 0.01 ? b.free.toFixed(2) : b.free.toPrecision(2)} ${b.currency}`;
     });
     await step('режим позицій one-way', async () => {
       const r = await this.ensureOneWay();

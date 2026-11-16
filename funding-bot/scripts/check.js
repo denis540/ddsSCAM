@@ -162,6 +162,9 @@ const timed = async (fn) => {
     }
   }
 
+  // Фактичні комісії акаунтів (як у бота): інакше сканер нижче рахує чистий профіт за стандартними
+  await Promise.all(Object.values(ex).filter((e) => e.hasKeys && e.loadAccountFees).map((e) => e.loadAccountFees().catch(() => {})));
+
   // 5) Стакани
   out('\n== 5. Стакани (BTC) ==');
   for (const e of Object.values(ex)) {
