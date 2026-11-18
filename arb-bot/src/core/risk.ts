@@ -42,6 +42,14 @@ export class RiskManager {
     log.error('TRADING HALTED', { reason });
   }
 
+  /** Human override via Telegram /resume (STOP file still wins). */
+  resume() {
+    this.halted = false;
+    this.haltReason = '';
+    this.consecutiveFailures = 0;
+    log.warn('trading resumed manually');
+  }
+
   private rollDay() {
     const d = utcDay();
     if (d !== this.day) {

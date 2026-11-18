@@ -11,6 +11,7 @@ export interface ChainCfg {
   stable: { symbol: string; address: Address; decimals: number };
   transferGasUsd: number;
   minNativeBalance: number;
+  coingeckoPlatform?: string;
 }
 
 export interface AssetCfg {
@@ -37,6 +38,20 @@ export interface Config {
     autoReturn: boolean;
     secondLegMaxLossBps: number;
     secondLegMaxWaitMin: number;
+    aggregators: string[];
+    /** Cheap 1-aggregator probe; full ladder only if edge ≥ this. */
+    probeEdgeBps: number;
+    maxAssetsParallel: number;
+    /** Dry run: simulate the second leg after this many minutes to get realistic PnL. */
+    paperTransferMin: number;
+    hedge: {
+      enabled: boolean;
+      /** true = skip opportunities that cannot be hedged */
+      required: boolean;
+      /** Where to short perps if the trading exchange has no perp market (in priority order). */
+      venues: string[];
+      leverage: number;
+    };
   };
   risk: {
     maxConcurrentCycles: number;
@@ -48,6 +63,7 @@ export interface Config {
   privateKey?: Hex;
   telegram: { token?: string; chatId?: string };
   kyberClientId: string;
+  odosApiKey?: string;
 }
 
 const env = (k: string) => (process.env[k] ? process.env[k] : undefined);
@@ -61,6 +77,17 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
     if (!rpc) throw new Error(`RPC env ${c.rpcEnv} for chain ${name} is empty`);
     chains[name] = { ...c, name, rpc };
   }
+  if (raw.assetsFile && fs.existsSync(raw.assetsFile)) {
+    const extra = JSON.parse(fs.readFileSync(raw.assetsFile, 'utf8')) as AssetCfg[];
+    const have = new Set((raw.assets ?? []).map((a: AssetCfg) => `${a.symbol}:${a.chain}`));
+    raw.assets = [...(raw.assets ?? []), ...extra.filter((a) => !have.has(`${a.symbol}:${a.chain}`) && chains[a.chain])];
+  }
+  const st = raw.strategy;
+  st.aggregators ??= ['kyber', 'odos'];
+  st.probeEdgeBps ??= Math.max(0, st.minProfitBps / 2);
+  st.maxAssetsParallel ??= 6;
+  st.paperTransferMin ??= 10;
+  st.hedge = { enabled: false, required: false, venues: [], leverage: 2, ...(st.hedge ?? {}) };
   for (const a of raw.assets as AssetCfg[]) {
     if (!chains[a.chain]) throw new Error(`asset ${a.symbol}: unknown chain ${a.chain}`);
   }
@@ -72,6 +99,7 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
     privateKey: env('PRIVATE_KEY') as Hex | undefined,
     telegram: { token: env('TELEGRAM_BOT_TOKEN'), chatId: env('TELEGRAM_CHAT_ID') },
     kyberClientId: env('KYBER_CLIENT_ID') ?? 'arb-bot',
+    odosApiKey: env('ODOS_API_KEY'),
   };
   if (!cfg.dryRun && !cfg.privateKey) throw new Error('PRIVATE_KEY required in live mode');
   return cfg;

@@ -41,3 +41,10 @@ test('unit conversions', () => {
   assert.equal(toUnits(1234.567891, 6), 1_234_567_891n);
   assert.equal(fromUnits(1_234_567_891n, 6), 1234.567891);
 });
+
+test('hedge fees are charged as cost', () => {
+  const dexBuy = new Curve([{ in: 100, out: 110 }, { in: 1000, out: 1090 }]);
+  const a = evalDexToCex(300, bids, dexBuy, costs)!;
+  const b = evalDexToCex(300, bids, dexBuy, { ...costs, hedgeFeeBps: 12 })!;
+  assert.ok(Math.abs(a.profitUsd - b.profitUsd - 300 * 0.0012) < 1e-9);
+});

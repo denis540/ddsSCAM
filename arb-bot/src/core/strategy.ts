@@ -63,6 +63,8 @@ export interface Costs {
   transferGasUsd: number; // ERC20 transfer (deposit to CEX)
   riskBufferBps: number;
   autoReturn: boolean;
+  /** Perp open+close taker fees when the transfer is hedged (0 = unhedged). */
+  hedgeFeeBps?: number;
 }
 
 export interface Opportunity {
@@ -84,7 +86,7 @@ export function evalCexToDex(size: number, asks: Level[], dexSell: Curve, c: Cos
   if (arrive <= 0) return null;
   const out = dexSell.out(arrive);
   if (out === null) return null;
-  const costs = c.dexGasUsd + (c.autoReturn ? c.transferGasUsd : 0) + (size * c.riskBufferBps) / 1e4;
+  const costs = c.dexGasUsd + (c.autoReturn ? c.transferGasUsd : 0) + (size * (c.riskBufferBps + (c.hedgeFeeBps ?? 0))) / 1e4;
   const profit = out - size - costs;
   return { direction: 'CEX_TO_DEX', sizeQuote: size, expectedAssetMoved: arrive, expectedOut: out, profitUsd: profit, profitBps: (profit / size) * 1e4, costsUsd: costs };
 }
@@ -96,7 +98,7 @@ export function evalDexToCex(size: number, bids: Level[], dexBuy: Curve, c: Cost
   const gross = walkBids(bids, tokens);
   if (gross === null) return null;
   const out = gross * (1 - c.takerFee);
-  const costs = c.dexGasUsd + c.transferGasUsd + (c.autoReturn ? c.withdrawFeeStable : 0) + (size * c.riskBufferBps) / 1e4;
+  const costs = c.dexGasUsd + c.transferGasUsd + (c.autoReturn ? c.withdrawFeeStable : 0) + (size * (c.riskBufferBps + (c.hedgeFeeBps ?? 0))) / 1e4;
   const profit = out - size - costs;
   return { direction: 'DEX_TO_CEX', sizeQuote: size, expectedAssetMoved: tokens, expectedOut: out, profitUsd: profit, profitBps: (profit / size) * 1e4, costsUsd: costs };
 }

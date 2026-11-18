@@ -7,6 +7,7 @@ export type Step =
   | 'CEX_BUY' | 'TO_FUND' | 'WITHDRAW' | 'AWAIT_ARRIVAL' | 'DEX_SELL' | 'RETURN_DEPOSIT'
   // DEX_TO_CEX
   | 'DEX_BUY' | 'DEPOSIT' | 'AWAIT_CREDIT' | 'TO_TRADE' | 'CEX_SELL' | 'RETURN_WITHDRAW'
+  | 'HEDGE_OPEN' | 'HEDGE_CLOSE'
   | 'DONE' | 'FAILED' | 'NEEDS_ATTENTION';
 
 export interface Cycle {
@@ -35,6 +36,12 @@ export interface Cycle {
   gasUsd?: number;
   pnlUsd?: number;
   error?: string;
+  // hedge
+  hedgeVenue?: string;
+  hedgeQty?: number;
+  hedgeOpenPx?: number;
+  hedgePnlUsd?: number;
+  dexSource?: string;
 }
 
 /** Durable cycle state: written atomically on every step so a crash/restart resumes exactly. */
@@ -47,6 +54,9 @@ export class CycleStore {
 
   active(): Cycle[] {
     return [...this.cycles.values()].filter((c) => !['DONE', 'FAILED', 'NEEDS_ATTENTION'].includes(c.step));
+  }
+  all(): Cycle[] {
+    return [...this.cycles.values()];
   }
   attention(): Cycle[] {
     return [...this.cycles.values()].filter((c) => c.step === 'NEEDS_ATTENTION');

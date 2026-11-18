@@ -184,6 +184,58 @@ export class Venue {
     return { id: String(order.id), filled: Number(order.filled ?? 0), cost: Number(order.cost ?? 0), feeBase, feeQuote };
   }
 
+  // ─────────── Perpetual hedge (USDT-margined linear swaps) ───────────
+  perpSymbol(asset: string) {
+    return `${asset}/${this.quote}:${this.quote}`;
+  }
+  hasPerp(asset: string) {
+    const m = this.ex.markets?.[this.perpSymbol(asset)];
+    return !!m && m.active !== false && m.swap && m.linear;
+  }
+  perpTakerFee(asset: string): number {
+    return this.ex.markets?.[this.perpSymbol(asset)]?.taker ?? 0.0006;
+  }
+  private leverageSet = new Set<string>();
+
+  /** Free USDT usable as perp margin (USDⓈ-M futures / unified / swap account). */
+  async marginFree(): Promise<number> {
+    const b = await this.ex.fetchBalance({ type: 'swap' });
+    return Number(b?.free?.[this.quote] ?? 0);
+  }
+
+  /**
+   * Open (side='sell') or close (side='buy', reduceOnly) a short of `qty` base units.
+   * Converts base qty → contracts via contractSize (OKX/Gate contracts ≠ coins).
+   * Returns base filled and average price.
+   */
+  async perpOrder(asset: string, side: 'sell' | 'buy', qty: number, leverage: number, reduceOnly: boolean) {
+    const sym = this.perpSymbol(asset);
+    const m = this.ex.markets[sym];
+    if (!this.leverageSet.has(sym)) {
+      try {
+        await this.ex.setLeverage(leverage, sym);
+      } catch (e) {
+        log.debug('setLeverage failed (may already be set)', { ex: this.id, sym, err: errMsg(e) });
+      }
+      this.leverageSet.add(sym);
+    }
+    const cs = Number(m.contractSize ?? 1);
+    const contracts = Number(this.ex.amountToPrecision(sym, qty / cs));
+    if (contracts <= 0) throw new Error(`hedge size below 1 contract (${qty} ${asset})`);
+    let o = await this.ex.createOrder(sym, 'market', side, contracts, undefined, reduceOnly ? { reduceOnly: true } : {});
+    for (let i = 0; i < 10 && (!o.filled || !o.average); i++) {
+      await sleep(300);
+      try {
+        o = await this.ex.fetchOrder(o.id, sym);
+      } catch {
+        /* lag */
+      }
+    }
+    const filledBase = Number(o.filled ?? contracts) * cs;
+    const avg = Number(o.average ?? o.price ?? 0);
+    return { id: String(o.id), filledBase, avg, fee: filledBase * avg * this.perpTakerFee(asset) };
+  }
+
   async depositAddress(code: string, network: string): Promise<Address> {
     const r = await this.ex.fetchDepositAddress(code, { network });
     if (r.tag) throw new Error(`deposit ${code} on ${this.id} requires memo/tag — not supported`);

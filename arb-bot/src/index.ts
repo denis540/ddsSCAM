@@ -1,7 +1,8 @@
 import { loadConfig } from './config.js';
 import { Venue } from './cex/venue.js';
 import { ChainWallet } from './chain/wallet.js';
-import { Kyber } from './chain/kyber.js';
+import { DexRouter } from './chain/aggregators.js';
+import { Journal, Blacklist } from './core/journal.js';
 import { CycleStore } from './core/store.js';
 import { CycleRunner } from './core/cycles.js';
 import { Scanner } from './core/scanner.js';
@@ -48,9 +49,28 @@ async function main() {
 
   const risk = new RiskManager(cfg.risk);
   const store = new CycleStore();
-  const kyber = new Kyber(cfg.kyberClientId);
-  const runner = new CycleRunner(cfg, store, venues, wallets, kyber, risk, notify);
-  const scanner = new Scanner(cfg, venues, wallets, kyber, runner, risk);
+  const dex = new DexRouter(cfg.strategy.aggregators, cfg.kyberClientId, cfg.odosApiKey, cfg.strategy.dexSlippageBps);
+  const journal = new Journal();
+  const blacklist = new Blacklist();
+  const runner = new CycleRunner(cfg, store, venues, wallets, dex, risk, notify, journal, blacklist);
+  const scanner = new Scanner(cfg, venues, wallets, dex, runner, risk, journal, blacklist);
+
+  // ── Telegram remote control
+  const fmtPnl = (since: number) =>
+    Object.entries(journal.summary(since)).map(([m, x]) => `${m}: ${x.n} cycles, pnl ${x.pnl.toFixed(2)}$, win ${x.n ? ((x.wins / x.n) * 100).toFixed(0) : 0}%`).join('\n') || 'no cycles yet';
+  notify.command('/help', () => '/status /cycles /opps /pnl /pause /resume');
+  notify.command('/status', () =>
+    [`mode: ${cfg.dryRun ? 'DRY RUN (paper)' : 'LIVE'}`, `trading: ${risk.halted ? `HALTED (${risk.haltReason})` : 'on'}`,
+      `exchanges: ${[...venues.keys()].join(', ')}`, `assets: ${cfg.assets.length}`, `active cycles: ${store.active().length}, attention: ${store.attention().length}`,
+      `today pnl: ${risk.dailyPnl.toFixed(2)}$`].join('\n'));
+  notify.command('/cycles', () =>
+    [...store.active(), ...store.attention()].map((c) => `${c.id} ${c.direction} ${c.step}${c.error ? ` (${c.error})` : ''}`).join('\n') || 'no active cycles');
+  notify.command('/opps', () =>
+    scanner.lastCandidates.slice(0, 10).map((c) => `${c.asset.symbol}@${c.exchange} ${c.direction} ${c.sizeQuote}$ → ${c.profitUsd.toFixed(2)}$ (${c.profitBps.toFixed(0)}bps)`).join('\n') || 'none right now');
+  notify.command('/pnl', () => `24h:\n${fmtPnl(Date.now() - 864e5)}\n7d:\n${fmtPnl(Date.now() - 7 * 864e5)}`);
+  notify.command('/pause', () => (risk.halt('paused via Telegram'), 'paused: no new cycles (active ones finish)'));
+  notify.command('/resume', () => (risk.resume(), 'resumed'));
+  notify.startPolling();
 
   runner.resumeAll(); // continue cycles interrupted by a restart
   notify.send(`🤖 arb bot started (${cfg.dryRun ? 'DRY RUN' : 'LIVE'}), exchanges: ${[...venues.keys()].join(', ')}`);
@@ -66,6 +86,7 @@ async function main() {
     log.info('shutting down — active cycles resume on next start', { sig });
     risk.halt(`shutdown (${sig})`);
     clearInterval(netTimer);
+    notify.stop();
     await Promise.all([...venues.values()].map((v) => v.close()));
     notify.send('🛑 arb bot stopped');
     setTimeout(() => process.exit(0), 300);

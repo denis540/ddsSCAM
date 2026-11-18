@@ -1,53 +1,168 @@
 {
   "dryRun": true,
   "quote": "USDT",
-  "exchanges": ["binance", "okx", "bybit", "gate", "kucoin", "bitget"],
-
+  "exchanges": [
+    "binance",
+    "okx",
+    "bybit",
+    "gate",
+    "kucoin",
+    "bitget"
+  ],
   "chains": {
     "arbitrum": {
       "chainId": 42161,
       "rpcEnv": "RPC_ARBITRUM",
       "kyberSlug": "arbitrum",
-      "networkCodes": ["ARBITRUM", "ARB", "ARBONE", "ARBEVM", "ARBI"],
-      "stable": { "symbol": "USDT", "address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", "decimals": 6 },
+      "networkCodes": [
+        "ARBITRUM",
+        "ARB",
+        "ARBONE",
+        "ARBEVM",
+        "ARBI"
+      ],
+      "stable": {
+        "symbol": "USDT",
+        "address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+        "decimals": 6
+      },
       "transferGasUsd": 0.05,
-      "minNativeBalance": 0.0005
+      "minNativeBalance": 0.0005,
+      "coingeckoPlatform": "arbitrum-one"
     },
     "bsc": {
       "chainId": 56,
       "rpcEnv": "RPC_BSC",
       "kyberSlug": "bsc",
-      "networkCodes": ["BEP20", "BSC"],
-      "stable": { "symbol": "USDT", "address": "0x55d398326f99059fF775485246999027B3197955", "decimals": 18 },
+      "networkCodes": [
+        "BEP20",
+        "BSC"
+      ],
+      "stable": {
+        "symbol": "USDT",
+        "address": "0x55d398326f99059fF775485246999027B3197955",
+        "decimals": 18
+      },
       "transferGasUsd": 0.05,
-      "minNativeBalance": 0.003
+      "minNativeBalance": 0.003,
+      "coingeckoPlatform": "binance-smart-chain"
+    },
+    "base": {
+      "chainId": 8453,
+      "rpcEnv": "RPC_BASE",
+      "kyberSlug": "base",
+      "coingeckoPlatform": "base",
+      "networkCodes": [
+        "BASE"
+      ],
+      "stable": {
+        "symbol": "USDC",
+        "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "decimals": 6
+      },
+      "transferGasUsd": 0.02,
+      "minNativeBalance": 0.0005
+    },
+    "polygon": {
+      "chainId": 137,
+      "rpcEnv": "RPC_POLYGON",
+      "kyberSlug": "polygon",
+      "coingeckoPlatform": "polygon-pos",
+      "networkCodes": [
+        "MATIC",
+        "POLYGON",
+        "POL"
+      ],
+      "stable": {
+        "symbol": "USDT",
+        "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+        "decimals": 6
+      },
+      "transferGasUsd": 0.02,
+      "minNativeBalance": 1
+    },
+    "optimism": {
+      "chainId": 10,
+      "rpcEnv": "RPC_OPTIMISM",
+      "kyberSlug": "optimism",
+      "coingeckoPlatform": "optimistic-ethereum",
+      "networkCodes": [
+        "OPTIMISM",
+        "OP",
+        "OPT",
+        "OPETH"
+      ],
+      "stable": {
+        "symbol": "USDT",
+        "address": "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58",
+        "decimals": 6
+      },
+      "transferGasUsd": 0.02,
+      "minNativeBalance": 0.0005
     }
   },
-
   "assets": [
-    { "symbol": "ARB",  "chain": "arbitrum", "address": "0x912CE59144191C1204E64559FE8253a0e49E6548", "decimals": 18 },
-    { "symbol": "GMX",  "chain": "arbitrum", "address": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", "decimals": 18 },
-    { "symbol": "CAKE", "chain": "bsc",      "address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", "decimals": 18 }
+    {
+      "symbol": "ARB",
+      "chain": "arbitrum",
+      "address": "0x912CE59144191C1204E64559FE8253a0e49E6548",
+      "decimals": 18
+    },
+    {
+      "symbol": "GMX",
+      "chain": "arbitrum",
+      "address": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a",
+      "decimals": 18
+    },
+    {
+      "symbol": "CAKE",
+      "chain": "bsc",
+      "address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82",
+      "decimals": 18
+    }
   ],
-
   "strategy": {
     "scanIntervalMs": 4000,
-    "tradeSizesQuote": [100, 300, 700, 1500],
+    "tradeSizesQuote": [
+      100,
+      300,
+      700,
+      1500
+    ],
     "minProfitUsd": 5,
     "minProfitBps": 80,
-    "riskBufferBps": 30,
+    "riskBufferBps": 40,
     "confirmScans": 2,
     "dexSlippageBps": 50,
     "autoReturn": true,
     "secondLegMaxLossBps": 150,
-    "secondLegMaxWaitMin": 20
+    "secondLegMaxWaitMin": 20,
+    "aggregators": [
+      "kyber",
+      "odos"
+    ],
+    "probeEdgeBps": 40,
+    "maxAssetsParallel": 6,
+    "paperTransferMin": 10,
+    "hedge": {
+      "enabled": true,
+      "required": false,
+      "venues": [
+        "bybit",
+        "binance",
+        "okx",
+        "bitget",
+        "gate"
+      ],
+      "leverage": 2
+    }
   },
-
   "risk": {
     "maxConcurrentCycles": 3,
     "maxDailyLossUsd": 100,
     "maxConsecutiveFailures": 3,
     "transferTimeoutMin": 60,
     "orderBookStaleMs": 5000
-  }
+  },
+  "assetsFile": "data/assets.discovered.json"
 }
