@@ -42,6 +42,10 @@ export interface Config {
     /** Cheap 1-aggregator probe; full ladder only if edge ≥ this. */
     probeEdgeBps: number;
     maxAssetsParallel: number;
+    /** Order books parsed in one worker thread per exchange (frees the main loop). */
+    marketDataWorkers: boolean;
+    /** Max frequency of book snapshots from workers, ms. */
+    bookThrottleMs: number;
     /** Dry run: simulate the second leg after this many minutes to get realistic PnL. */
     paperTransferMin: number;
     hedge: {
@@ -86,6 +90,8 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
   st.aggregators ??= ['kyber', 'odos'];
   st.probeEdgeBps ??= Math.max(0, st.minProfitBps / 2);
   st.maxAssetsParallel ??= 6;
+  st.marketDataWorkers ??= true;
+  st.bookThrottleMs ??= 50;
   st.paperTransferMin ??= 10;
   st.hedge = { enabled: false, required: false, venues: [], leverage: 2, ...(st.hedge ?? {}) };
   for (const a of raw.assets as AssetCfg[]) {

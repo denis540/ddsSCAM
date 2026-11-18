@@ -10,6 +10,7 @@ import { RiskManager } from './core/risk.js';
 import { Notifier } from './core/notifier.js';
 import { log, errMsg } from './core/logger.js';
 import { sleep } from './core/utils.js';
+import { loopLag } from './core/lag.js';
 
 async function main() {
   const cfg = loadConfig();
@@ -38,7 +39,7 @@ async function main() {
         await v.refreshNetworks(cfg.assets, cfg.chains);
         venues.set(id, v);
         const markets = cfg.assets.filter((a) => v.hasMarket(a.symbol));
-        markets.forEach((a) => v.watchBook(a.symbol));
+        v.streamBooks(markets.map((a) => a.symbol), cfg.strategy.marketDataWorkers, cfg.strategy.bookThrottleMs);
         log.info('exchange ready', { id, markets: markets.map((a) => a.symbol), networks: Object.fromEntries(v.net) });
       } catch (e) {
         log.error('exchange disabled', { id, err: errMsg(e) });
@@ -62,7 +63,7 @@ async function main() {
   notify.command('/status', () =>
     [`mode: ${cfg.dryRun ? 'DRY RUN (paper)' : 'LIVE'}`, `trading: ${risk.halted ? `HALTED (${risk.haltReason})` : 'on'}`,
       `exchanges: ${[...venues.keys()].join(', ')}`, `assets: ${cfg.assets.length}`, `active cycles: ${store.active().length}, attention: ${store.attention().length}`,
-      `today pnl: ${risk.dailyPnl.toFixed(2)}$`].join('\n'));
+      `today pnl: ${risk.dailyPnl.toFixed(2)}$`, `main loop lag p99: ${loopLag().p99.toFixed(1)} ms`].join('\n'));
   notify.command('/cycles', () =>
     [...store.active(), ...store.attention()].map((c) => `${c.id} ${c.direction} ${c.step}${c.error ? ` (${c.error})` : ''}`).join('\n') || 'no active cycles');
   notify.command('/opps', () =>

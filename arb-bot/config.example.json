@@ -155,7 +155,9 @@
         "gate"
       ],
       "leverage": 2
-    }
+    },
+    "marketDataWorkers": true,
+    "bookThrottleMs": 50
   },
   "risk": {
     "maxConcurrentCycles": 3,

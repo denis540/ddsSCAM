@@ -8,6 +8,7 @@ import type { Journal, Blacklist } from './journal.js';
 import { Curve, evalCexToDex, evalDexToCex, pickBest, walkBids, type Opportunity, type Costs } from './strategy.js';
 import { log, errMsg } from './logger.js';
 import { toUnits, fromUnits } from './utils.js';
+import { loopLag } from './lag.js';
 
 interface Candidate extends Opportunity {
   exchange: string;
@@ -69,7 +70,7 @@ export class Scanner {
     const ready = cands.filter((c) => (this.streak.get(c.key) ?? 0) >= this.cfg.strategy.confirmScans).sort((a, b) => b.profitUsd - a.profitUsd);
     for (const c of ready) await this.maybeStart(c);
 
-    if (++this.scans % 50 === 0) log.info('heartbeat', { scans: this.scans, assets: assets.length, candidates: cands.length, dailyPnl: +this.risk.dailyPnl.toFixed(2) });
+    if (++this.scans % 50 === 0) log.info('heartbeat', { scans: this.scans, assets: assets.length, candidates: cands.length, dailyPnl: +this.risk.dailyPnl.toFixed(2), ...loopLag(true) });
   }
 
   private freshBook(v: Venue, asset: string): Book | null {

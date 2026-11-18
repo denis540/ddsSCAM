@@ -1,4 +1,5 @@
 import ccxt from 'ccxt';
+import { Worker } from 'node:worker_threads';
 import type { Address } from 'viem';
 import { exchangeCreds, type AssetCfg, type ChainCfg } from '../config.js';
 import { log, errMsg } from '../core/logger.js';
@@ -70,7 +71,49 @@ export class Venue {
     await this.ex.loadMarkets();
   }
 
-  /** Background WS order-book stream with reconnect. */
+  private worker?: Worker;
+
+  /**
+   * Stream all order books of this exchange in a dedicated worker thread
+   * (auto-restarts on crash). Falls back to in-process streams if workers are off.
+   */
+  streamBooks(assets: string[], useWorker: boolean, throttleMs = 50) {
+    if (!assets.length) return;
+    if (!useWorker) return assets.forEach((a) => this.watchBook(a));
+    const dev = import.meta.url.endsWith('.ts');
+    const file = new URL(dev ? './bookWorker.ts' : './bookWorker.js', import.meta.url);
+    let restarts = 0;
+    const spawn = () => {
+      const w = new Worker(file, {
+        workerData: { exchangeId: this.id, symbols: assets.map((a) => ({ asset: a, symbol: this.symbol(a) })), depth: 20, throttleMs },
+      });
+      this.worker = w;
+      w.on('message', (m: any) => {
+        if (m.type === 'books') {
+          for (const b of m.batch) this.books.set(b.asset, { bids: b.bids, asks: b.asks, ts: b.ts });
+        } else if (m.type === 'error') {
+          this.books.delete(m.asset);
+          log.warn('book stream error', { ex: this.id, asset: m.asset, err: m.err });
+        } else if (m.type === 'ready') {
+          restarts = 0;
+          log.info('market-data worker ready', { ex: this.id, symbols: m.count });
+        } else if (m.type === 'fatal') {
+          log.error('market-data worker fatal', { ex: this.id, err: m.err });
+        }
+      });
+      w.on('error', (e) => log.error('market-data worker crashed', { ex: this.id, err: errMsg(e) }));
+      w.on('exit', () => {
+        for (const a of assets) this.books.delete(a); // never trade on data from a dead stream
+        if (this.stopped) return;
+        const delay = Math.min(1000 * 2 ** restarts++, 30_000);
+        log.warn('market-data worker exited, restarting', { ex: this.id, inMs: delay });
+        setTimeout(spawn, delay);
+      });
+    };
+    spawn();
+  }
+
+  /** In-process WS order-book stream with reconnect (used when workers are disabled). */
   watchBook(asset: string) {
     const sym = this.symbol(asset);
     const loop = async () => {
@@ -263,6 +306,10 @@ export class Venue {
 
   async close() {
     this.stopped = true;
+    if (this.worker) {
+      this.worker.postMessage('stop');
+      setTimeout(() => void this.worker?.terminate(), 2000).unref();
+    }
     try {
       await this.ex.close();
     } catch {
