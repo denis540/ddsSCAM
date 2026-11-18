@@ -1,0 +1,53 @@
+{
+  "dryRun": true,
+  "quote": "USDT",
+  "exchanges": ["binance", "okx", "bybit", "gate", "kucoin", "bitget"],
+
+  "chains": {
+    "arbitrum": {
+      "chainId": 42161,
+      "rpcEnv": "RPC_ARBITRUM",
+      "kyberSlug": "arbitrum",
+      "networkCodes": ["ARBITRUM", "ARB", "ARBONE", "ARBEVM", "ARBI"],
+      "stable": { "symbol": "USDT", "address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", "decimals": 6 },
+      "transferGasUsd": 0.05,
+      "minNativeBalance": 0.0005
+    },
+    "bsc": {
+      "chainId": 56,
+      "rpcEnv": "RPC_BSC",
+      "kyberSlug": "bsc",
+      "networkCodes": ["BEP20", "BSC"],
+      "stable": { "symbol": "USDT", "address": "0x55d398326f99059fF775485246999027B3197955", "decimals": 18 },
+      "transferGasUsd": 0.05,
+      "minNativeBalance": 0.003
+    }
+  },
+
+  "assets": [
+    { "symbol": "ARB",  "chain": "arbitrum", "address": "0x912CE59144191C1204E64559FE8253a0e49E6548", "decimals": 18 },
+    { "symbol": "GMX",  "chain": "arbitrum", "address": "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a", "decimals": 18 },
+    { "symbol": "CAKE", "chain": "bsc",      "address": "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", "decimals": 18 }
+  ],
+
+  "strategy": {
+    "scanIntervalMs": 4000,
+    "tradeSizesQuote": [100, 300, 700, 1500],
+    "minProfitUsd": 5,
+    "minProfitBps": 80,
+    "riskBufferBps": 30,
+    "confirmScans": 2,
+    "dexSlippageBps": 50,
+    "autoReturn": true,
+    "secondLegMaxLossBps": 150,
+    "secondLegMaxWaitMin": 20
+  },
+
+  "risk": {
+    "maxConcurrentCycles": 3,
+    "maxDailyLossUsd": 100,
+    "maxConsecutiveFailures": 3,
+    "transferTimeoutMin": 60,
+    "orderBookStaleMs": 5000
+  }
+}

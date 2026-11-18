@@ -1,9 +1,8 @@
-import type { Level } from '../cex/binance.js';
-import { floorToStep } from './utils.js';
+import type { Level } from '../cex/venue.js';
 
-export type Direction = 'DEX_BUY_CEX_SELL' | 'CEX_BUY_DEX_SELL';
+export type Direction = 'CEX_TO_DEX' | 'DEX_TO_CEX';
 
-/** Sell `baseQty` into bids. Returns gross quote received, or null if book too thin. */
+/** Sell `baseQty` into bids → gross quote, or null if the book is too thin. */
 export function walkBids(bids: Level[], baseQty: number): number | null {
   let left = baseQty;
   let quote = 0;
@@ -16,94 +15,94 @@ export function walkBids(bids: Level[], baseQty: number): number | null {
   return null;
 }
 
-/** Buy `baseQty` from asks. Returns gross quote cost, or null if book too thin. */
-export function walkAsks(asks: Level[], baseQty: number): number | null {
-  let left = baseQty;
-  let cost = 0;
+/** Spend `quoteAmt` on asks → base received (gross), or null if the book is too thin. */
+export function buyWithQuote(asks: Level[], quoteAmt: number): number | null {
+  let left = quoteAmt;
+  let base = 0;
   for (const [p, q] of asks) {
-    const take = Math.min(left, q);
-    cost += take * p;
-    left -= take;
-    if (left <= 1e-12) return cost;
+    const cost = Math.min(left, p * q);
+    base += cost / p;
+    left -= cost;
+    if (left <= 1e-9) return base;
   }
   return null;
 }
 
-export interface Evaluation {
+/**
+ * DEX price curve from a few aggregator quotes: out(x) via linear
+ * interpolation of the execution price. Beyond 10% over the largest probe → null.
+ */
+export class Curve {
+  private pts: { x: number; px: number }[];
+  constructor(points: { in: number; out: number }[]) {
+    this.pts = points.filter((p) => p.in > 0 && p.out > 0).map((p) => ({ x: p.in, px: p.out / p.in })).sort((a, b) => a.x - b.x);
+  }
+  get empty() {
+    return this.pts.length === 0;
+  }
+  out(x: number): number | null {
+    const p = this.pts;
+    if (!p.length || x <= 0) return null;
+    if (x <= p[0].x) return x * p[0].px;
+    for (let i = 1; i < p.length; i++) {
+      if (x <= p[i].x) {
+        const t = (x - p[i - 1].x) / (p[i].x - p[i - 1].x);
+        return x * (p[i - 1].px + t * (p[i].px - p[i - 1].px));
+      }
+    }
+    const last = p[p.length - 1];
+    return x <= last.x * 1.1 ? x * last.px : null;
+  }
+}
+
+export interface Costs {
+  takerFee: number;
+  withdrawFeeAsset: number; // CEX → wallet, in asset units
+  withdrawFeeStable: number; // CEX → wallet for returning stable, in USD
+  dexGasUsd: number;
+  transferGasUsd: number; // ERC20 transfer (deposit to CEX)
+  riskBufferBps: number;
+  autoReturn: boolean;
+}
+
+export interface Opportunity {
   direction: Direction;
-  sizeQuote: number; // notional in quote currency
-  dexIn: number; // amount sent into the DEX (quote for BUY, base for SELL)
-  dexOut: number; // expected DEX output (base for BUY, quote for SELL)
-  cexBaseQty: number; // qty for the CEX hedge
-  cexQuote: number; // CEX proceeds (sell) or cost (buy) incl. taker fee
-  gasUsd: number;
+  sizeQuote: number;
+  expectedAssetMoved: number; // tokens that travel between venues
+  expectedOut: number; // final stable/quote received
   profitUsd: number;
   profitBps: number;
+  costsUsd: number;
 }
 
-export interface CostParams {
-  takerFee: number;
-  stepSize: number;
-  minQty: number;
-  minNotional: number;
-  gasUsd: number;
+/** Buy on CEX → withdraw → sell on DEX (→ deposit stable back). */
+export function evalCexToDex(size: number, asks: Level[], dexSell: Curve, c: Costs): Opportunity | null {
+  const gross = buyWithQuote(asks, size);
+  if (gross === null) return null;
+  const bought = gross * (1 - c.takerFee);
+  const arrive = bought - c.withdrawFeeAsset;
+  if (arrive <= 0) return null;
+  const out = dexSell.out(arrive);
+  if (out === null) return null;
+  const costs = c.dexGasUsd + (c.autoReturn ? c.transferGasUsd : 0) + (size * c.riskBufferBps) / 1e4;
+  const profit = out - size - costs;
+  return { direction: 'CEX_TO_DEX', sizeQuote: size, expectedAssetMoved: arrive, expectedOut: out, profitUsd: profit, profitBps: (profit / size) * 1e4, costsUsd: costs };
 }
 
-/** DEX: spend `quoteIn` -> receive `baseOut`; CEX: sell base into bids. */
-export function evalDexBuy(quoteIn: number, baseOut: number, bids: Level[], p: CostParams): Evaluation | null {
-  const qty = floorToStep(baseOut, p.stepSize);
-  if (qty < p.minQty || bids.length === 0) return null;
-  const gross = walkBids(bids, qty);
-  if (gross === null || gross < p.minNotional) return null;
-  const net = gross * (1 - p.takerFee);
-  const dust = (baseOut - qty) * bids[0][0]; // remainder stays in inventory, marked at best bid
-  const profit = net + dust - quoteIn - p.gasUsd;
-  return {
-    direction: 'DEX_BUY_CEX_SELL',
-    sizeQuote: quoteIn,
-    dexIn: quoteIn,
-    dexOut: baseOut,
-    cexBaseQty: qty,
-    cexQuote: net,
-    gasUsd: p.gasUsd,
-    profitUsd: profit,
-    profitBps: (profit / quoteIn) * 1e4,
-  };
+/** Buy on DEX → deposit to CEX → sell on CEX (→ withdraw stable back). */
+export function evalDexToCex(size: number, bids: Level[], dexBuy: Curve, c: Costs): Opportunity | null {
+  const tokens = dexBuy.out(size);
+  if (tokens === null) return null;
+  const gross = walkBids(bids, tokens);
+  if (gross === null) return null;
+  const out = gross * (1 - c.takerFee);
+  const costs = c.dexGasUsd + c.transferGasUsd + (c.autoReturn ? c.withdrawFeeStable : 0) + (size * c.riskBufferBps) / 1e4;
+  const profit = out - size - costs;
+  return { direction: 'DEX_TO_CEX', sizeQuote: size, expectedAssetMoved: tokens, expectedOut: out, profitUsd: profit, profitBps: (profit / size) * 1e4, costsUsd: costs };
 }
 
-/** DEX: sell `baseIn` -> receive `quoteOut`; CEX: buy the same base back from asks. */
-export function evalDexSell(baseIn: number, quoteOut: number, asks: Level[], p: CostParams): Evaluation | null {
-  if (baseIn < p.minQty || asks.length === 0) return null;
-  const gross = walkAsks(asks, baseIn);
-  if (gross === null || gross < p.minNotional) return null;
-  const cost = gross * (1 + p.takerFee);
-  const profit = quoteOut - cost - p.gasUsd;
-  return {
-    direction: 'CEX_BUY_DEX_SELL',
-    sizeQuote: gross,
-    dexIn: baseIn,
-    dexOut: quoteOut,
-    cexBaseQty: baseIn,
-    cexQuote: cost,
-    gasUsd: p.gasUsd,
-    profitUsd: profit,
-    profitBps: (profit / gross) * 1e4,
-  };
-}
-
-/** Evenly spaced trade sizes between min and max (inclusive). */
-export function sizeLadder(min: number, max: number, steps: number): number[] {
-  if (steps <= 1 || max <= min) return [max];
-  const out: number[] = [];
-  for (let i = 0; i < steps; i++) out.push(min + ((max - min) * i) / (steps - 1));
-  return out;
-}
-
-export function pickBest(evals: (Evaluation | null)[], minProfitUsd: number, minProfitBps: number): Evaluation | null {
-  let best: Evaluation | null = null;
-  for (const e of evals) {
-    if (!e || e.profitUsd < minProfitUsd || e.profitBps < minProfitBps) continue;
-    if (!best || e.profitUsd > best.profitUsd) best = e;
-  }
+export function pickBest(ops: (Opportunity | null)[], minUsd: number, minBps: number): Opportunity | null {
+  let best: Opportunity | null = null;
+  for (const o of ops) if (o && o.profitUsd >= minUsd && o.profitBps >= minBps && (!best || o.profitUsd > best.profitUsd)) best = o;
   return best;
 }
