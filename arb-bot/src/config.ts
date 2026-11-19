@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import fs from 'node:fs';
+import type { FeeMode } from './cex/venue.js';
 import type { Address, Hex } from 'viem';
 
 export interface ChainCfg {
@@ -25,6 +26,7 @@ export interface Config {
   dryRun: boolean;
   quote: string;
   exchanges: string[];
+  withdrawFeeMode: Record<string, FeeMode>;
   chains: Record<string, ChainCfg>;
   assets: AssetCfg[];
   strategy: {
@@ -64,6 +66,8 @@ export interface Config {
       /** Where to short perps if the trading exchange has no perp market (in priority order). */
       venues: string[];
       leverage: number;
+      /** Skip a hedge venue if shorts PAY more than this per 8h (bps). 10 = 0.1%/8h */
+      maxNegFundingBps8h: number;
     };
   };
   risk: {
@@ -72,6 +76,15 @@ export interface Config {
     maxConsecutiveFailures: number;
     transferTimeoutMin: number;
     orderBookStaleMs: number;
+    /** No new cycles while this many cycles wait for manual action (/resolve). */
+    maxAttentionCycles: number;
+    equity: {
+      checkEveryMin: number;
+      /** Alert if equity is below expected by more than this % … */
+      alertDropPct: number;
+      /** … and stop new cycles if below by more than this %. */
+      haltDropPct: number;
+    };
   };
   privateKey?: Hex;
   telegram: { token?: string; chatId?: string };
@@ -104,7 +117,10 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
   st.marketDataWorkers ??= true;
   st.bookThrottleMs ??= 50;
   st.paperTransferMin ??= 10;
-  st.hedge = { enabled: false, required: false, venues: [], leverage: 2, ...(st.hedge ?? {}) };
+  st.hedge = { enabled: false, required: false, venues: [], leverage: 2, maxNegFundingBps8h: 10, ...(st.hedge ?? {}) };
+  raw.withdrawFeeMode ??= {};
+  raw.risk.maxAttentionCycles ??= 1;
+  raw.risk.equity = { checkEveryMin: 10, alertDropPct: 1.5, haltDropPct: 4, ...(raw.risk.equity ?? {}) };
   for (const a of raw.assets as AssetCfg[]) {
     if (!chains[a.chain]) throw new Error(`asset ${a.symbol}: unknown chain ${a.chain}`);
   }
@@ -113,7 +129,7 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
     ...raw,
     dryRun: envDry !== undefined ? envDry === 'true' : raw.dryRun !== false,
     chains,
-    privateKey: env('PRIVATE_KEY') as Hex | undefined,
+    privateKey: readPrivateKey(),
     telegram: { token: env('TELEGRAM_BOT_TOKEN'), chatId: env('TELEGRAM_CHAT_ID') },
     kyberClientId: env('KYBER_CLIENT_ID') ?? 'arb-bot',
     odosApiKey: env('ODOS_API_KEY'),
@@ -126,4 +142,16 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
 export function exchangeCreds(id: string) {
   const p = id.toUpperCase();
   return { apiKey: env(`${p}_API_KEY`), secret: env(`${p}_SECRET`), password: env(`${p}_PASSWORD`) };
+}
+
+/** PRIVATE_KEY_FILE (file with chmod 600, outside the repo) is preferred over plain PRIVATE_KEY in .env. */
+function readPrivateKey(): Hex | undefined {
+  const f = env('PRIVATE_KEY_FILE');
+  if (f) {
+    const st = fs.statSync(f);
+    if ((st.mode & 0o077) !== 0) throw new Error(`${f} is readable by other users — run: chmod 600 ${f}`);
+    const k = fs.readFileSync(f, 'utf8').trim();
+    return (k.startsWith('0x') ? k : `0x${k}`) as Hex;
+  }
+  return env('PRIVATE_KEY') as Hex | undefined;
 }

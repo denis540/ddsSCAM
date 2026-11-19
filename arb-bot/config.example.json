@@ -155,7 +155,8 @@
         "bitget",
         "gate"
       ],
-      "leverage": 2
+      "leverage": 2,
+      "maxNegFundingBps8h": 10
     },
     "marketDataWorkers": true,
     "bookThrottleMs": 50
@@ -165,7 +166,16 @@
     "maxDailyLossUsd": 100,
     "maxConsecutiveFailures": 3,
     "transferTimeoutMin": 60,
-    "orderBookStaleMs": 5000
+    "orderBookStaleMs": 5000,
+    "maxAttentionCycles": 1,
+    "equity": {
+      "checkEveryMin": 10,
+      "alertDropPct": 1.5,
+      "haltDropPct": 4
+    }
   },
-  "assetsFile": "data/assets.discovered.json"
+  "assetsFile": "data/assets.discovered.json",
+  "withdrawFeeMode": {
+    "_comment": "deducted | extra | unknown \u2014 override if selftest/first test cycle shows otherwise"
+  }
 }

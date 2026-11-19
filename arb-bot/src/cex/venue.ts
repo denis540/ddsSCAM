@@ -14,6 +14,7 @@ export interface NetInfo {
   withdraw: boolean;
   withdrawFee: number; // in asset units (NaN = unknown)
   withdrawMin: number;
+  depositMin: number; // deposits below this are often NOT credited (lost)
   contractOk: boolean | null; // null = exchange doesn't expose the contract
 }
 
@@ -39,6 +40,23 @@ const ACCOUNTS: Record<string, [string, string] | null> = {
   kucoin: ['main', 'spot'],
 };
 
+/**
+ * How the exchange charges the withdrawal fee:
+ *  deducted — fee comes out of the requested amount (receive amount − fee)
+ *  extra    — fee is charged on top from the balance (receive the full amount)
+ *  unknown  — plan conservatively: keep the fee in balance AND expect amount − fee
+ * Override per exchange in config.json → "withdrawFeeMode": { "gate": "extra" }
+ */
+export type FeeMode = 'deducted' | 'extra' | 'unknown';
+export const WITHDRAW_FEE_MODE: Record<string, FeeMode> = {
+  binance: 'deducted',
+  kucoin: 'deducted', // ccxt sends feeDeductType=INTERNAL
+  okx: 'extra', // OKX: "withdrawal fee is not included in amt"
+  bybit: 'extra', // Bybit v5 feeType=0 (default): amount = received
+  gate: 'unknown',
+  bitget: 'unknown',
+};
+
 /** Unified wrapper over one ccxt exchange: books, orders, deposits, withdrawals, internal transfers. */
 export class Venue {
   readonly ex: any;
@@ -46,7 +64,11 @@ export class Venue {
   readonly net = new Map<string, NetInfo>(); // key: `${code}:${chain}`
   private stopped = false;
 
-  constructor(readonly id: string, private quote: string) {
+  feeMode: FeeMode = 'unknown';
+  private funding = new Map<string, { rate8h: number; at: number }>();
+
+  constructor(readonly id: string, private quote: string, feeModeOverride?: FeeMode) {
+    this.feeMode = feeModeOverride ?? WITHDRAW_FEE_MODE[id] ?? 'unknown';
     const Cls = (ccxt as any).pro[id];
     if (!Cls) throw new Error(`exchange ${id} not supported by ccxt.pro`);
     const c = exchangeCreds(id);
@@ -165,6 +187,7 @@ export class Venue {
           withdraw: n.withdraw !== false && n.active !== false,
           withdrawFee: n.fee === undefined || n.fee === null ? NaN : Number(n.fee),
           withdrawMin: Number(n.limits?.withdraw?.min ?? 0),
+          depositMin: Number(n.limits?.deposit?.min ?? 0),
           contractOk: contractMatches(n.info, addr),
         });
       }
@@ -285,9 +308,47 @@ export class Venue {
     return r.address as Address;
   }
 
+  /** Floor an amount to the currency's withdrawal precision (never round up past the balance). */
+  floorCurrency(code: string, amount: number): number {
+    const prec = this.ex.currencies?.[code]?.precision;
+    if (prec === undefined) return amount;
+    return Number(this.ex.decimalToPrecision(amount, 0 /* TRUNCATE */, prec, this.ex.precisionMode));
+  }
+
+  /**
+   * Decide the amount to request so the withdrawal never fails for "insufficient
+   * balance" (fee on top) and return a safe lower bound of what will arrive.
+   */
+  withdrawPlan(code: string, wanted: number, free: number, net: NetInfo): { amount: number; minReceived: number } {
+    const fee = Number.isFinite(net.withdrawFee) ? net.withdrawFee : 0;
+    const raw = this.feeMode === 'deducted' ? Math.min(wanted, free) : Math.min(wanted, free - fee);
+    const amount = this.floorCurrency(code, raw);
+    if (amount <= 0 || amount < net.withdrawMin) throw new WithdrawBelowMin(`${code} withdraw ${amount} below min ${net.withdrawMin} on ${this.id}`);
+    const minReceived = this.feeMode === 'extra' ? amount : amount - fee;
+    return { amount, minReceived };
+  }
+
+  /** Funding rate normalised to 8h, cached 5 min; refreshed in background (never blocks scanning). */
+  fundingRate8h(asset: string): number | undefined {
+    const c = this.funding.get(asset);
+    if (!c || Date.now() - c.at > 5 * 60_000) {
+      if (!c || c.at > 0) {
+        this.funding.set(asset, { rate8h: c?.rate8h ?? NaN, at: 0 }); // mark "refreshing"
+        this.ex
+          .fetchFundingRate(this.perpSymbol(asset))
+          .then((r: any) => {
+            const hours = Number(String(r.interval ?? '8h').replace('h', '')) || 8;
+            this.funding.set(asset, { rate8h: (Number(r.fundingRate) * 8) / hours, at: Date.now() });
+          })
+          .catch(() => this.funding.set(asset, { rate8h: NaN, at: Date.now() }));
+      }
+    }
+    const v = this.funding.get(asset)?.rate8h;
+    return v === undefined || Number.isNaN(v) ? undefined : v;
+  }
+
   async withdraw(code: string, amount: number, address: Address, network: string): Promise<string> {
-    const amt = Number(this.ex.currencyToPrecision(code, amount));
-    const r = await this.ex.withdraw(code, amt, address, undefined, { network });
+    const r = await this.ex.withdraw(code, this.floorCurrency(code, amount), address, undefined, { network });
     return String(r.id);
   }
 
@@ -317,6 +378,8 @@ export class Venue {
     }
   }
 }
+
+export class WithdrawBelowMin extends Error {}
 
 /** If the exchange exposes contract addresses, verify it's OUR token (same ticker ≠ same token!). */
 function contractMatches(info: unknown, addr: string): boolean | null {

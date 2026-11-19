@@ -51,6 +51,10 @@ export class CycleRunner {
     return new Set(this.store.active().map((c) => c.asset));
   }
 
+  attentionCount() {
+    return this.store.attention().length;
+  }
+
   start(c: Cycle) {
     this.store.save(c);
     this.run(c);
@@ -62,6 +66,35 @@ export class CycleRunner {
       this.run(c);
     }
     for (const c of this.store.attention()) this.notify.send(`⚠️ cycle ${c.id} needs attention: ${c.error}`);
+  }
+
+  /**
+   * Telegram /resolve <id> [pnl]: a human has finished a NEEDS_ATTENTION cycle by
+   * hand. Records the real result so daily loss limits and the journal stay honest.
+   */
+  resolve(id: string, pnlUsd: number): string {
+    const c = this.store.attention().find((x) => x.id === id || x.id.startsWith(id));
+    if (!c) return `no cycle needing attention with id ${id}`;
+    if (c.hedgeQty) return `cycle ${c.id} still has an open hedge (${c.hedgeQty} ${c.asset} short on ${c.hedgeVenue}) — close it first, then /resolve again with ${c.id} hedgeclosed`;
+    c.step = 'FAILED';
+    c.pnlUsd = pnlUsd;
+    c.error = `${c.error} | resolved manually`;
+    this.store.save(c);
+    pnlUsd >= 0 ? this.risk.recordTrade(pnlUsd) : this.risk.recordFailure(-pnlUsd);
+    this.journal.add({
+      mode: 'live', id: c.id, exchange: c.exchange, asset: c.asset, chain: c.chain, direction: c.direction, sizeUsd: c.sizeQuote,
+      expectedUsd: c.expectedProfitUsd, realizedUsd: pnlUsd, minutes: (Date.now() - c.createdAt) / 60000, note: 'resolved manually',
+    });
+    return `cycle ${c.id} resolved, pnl ${pnlUsd}$ recorded`;
+  }
+
+  /** Human confirms the perp hedge of an attention cycle was closed by hand. */
+  hedgeClosed(id: string): void {
+    const c = this.store.attention().find((x) => x.id === id);
+    if (c) {
+      c.hedgeQty = undefined;
+      this.store.save(c);
+    }
   }
 
   private run(c: Cycle) {
@@ -144,8 +177,10 @@ export class CycleRunner {
     const { chain, venue } = this.ctx(c);
     const sn = venue.net.get(`${chain.stable.symbol}:${chain.name}`);
     if (!this.cfg.strategy.autoReturn || chain.stable.symbol !== this.cfg.quote || !sn) return 'DONE';
-    if (c.direction === 'CEX_TO_DEX') return sn.deposit ? 'RETURN_DEPOSIT' : 'DONE';
-    return sn.withdraw ? 'RETURN_WITHDRAW' : 'DONE';
+    // amounts below the exchange minimum would be lost (deposit) or rejected (withdraw)
+    const amt = c.quoteReceived ?? 0;
+    if (c.direction === 'CEX_TO_DEX') return sn.deposit && amt >= sn.depositMin ? 'RETURN_DEPOSIT' : 'DONE';
+    return sn.withdraw && amt >= sn.withdrawMin + (Number.isFinite(sn.withdrawFee) ? sn.withdrawFee : 0) ? 'RETURN_WITHDRAW' : 'DONE';
   }
 
   private afterFirstLeg(c: Cycle): Step {
@@ -248,10 +283,11 @@ export class CycleRunner {
           return this.go(c, 'AWAIT_ARRIVAL', { withdrawId: id });
         }
         const free = await venue.free(asset.symbol, 'fund');
-        const amount = Math.min(free, c.assetAmount!);
+        // fee handling differs per exchange (deducted vs on top) → plan never fails on balance
+        const plan = venue.withdrawPlan(asset.symbol, c.assetAmount!, free, assetNet);
         this.mark(c);
-        const id = await venue.withdraw(asset.symbol, amount, wallet.address, assetNet.network).catch((e) => this.rejectIfDefinitive(c, e));
-        return this.go(c, 'AWAIT_ARRIVAL', { withdrawId: id, assetAmount: amount - (Number.isFinite(assetNet.withdrawFee) ? assetNet.withdrawFee : 0) });
+        const id = await venue.withdraw(asset.symbol, plan.amount, wallet.address, assetNet.network).catch((e) => this.rejectIfDefinitive(c, e));
+        return this.go(c, 'AWAIT_ARRIVAL', { withdrawId: id, assetAmount: plan.minReceived });
       }
       case 'AWAIT_ARRIVAL': {
         const arrived = (await wallet.balanceOf(asset.address)) - BigInt(c.walletBalBefore!);
@@ -275,6 +311,9 @@ export class CycleRunner {
           throw new Retryable();
         }
         if (c.inflight && !c.txHash) throw new Error('crashed while sending deposit — check wallet');
+        if (!c.txHash && c.assetAmount! < assetNet.depositMin) {
+          throw new Error(`deposit ${c.assetAmount} ${asset.symbol} below exchange minimum ${assetNet.depositMin} — tokens kept in wallet`);
+        }
         if (!c.txHash) {
           const addr = await venue.depositAddress(asset.symbol, assetNet.network);
           c.cexBalBefore = await venue.free(asset.symbol, 'fund');
@@ -315,6 +354,7 @@ export class CycleRunner {
         const out = await wallet.receivedInTx(c.txHash, chain.stable.address);
         if (quoted) this.checkTax(c, out, quoted);
         const received = fromUnits(out, chain.stable.decimals);
+        c.quoteReceived = received;
         const next = c.hedgeQty ? 'HEDGE_CLOSE' : this.afterSecondLeg(c);
         return this.go(c, next, { quoteReceived: received, txHash: undefined, pnlUsd: received - c.quoteSpent! });
       }
@@ -325,6 +365,7 @@ export class CycleRunner {
         this.mark(c);
         const f = await venue.marketSell(asset.symbol, Math.min(free, c.assetAmount!)).catch((e) => this.rejectIfDefinitive(c, e));
         const received = f.cost - f.feeQuote;
+        c.quoteReceived = received;
         const next = c.hedgeQty ? 'HEDGE_CLOSE' : this.afterSecondLeg(c);
         return this.go(c, next, { quoteReceived: received, pnlUsd: received - c.quoteSpent! });
       }
@@ -339,7 +380,7 @@ export class CycleRunner {
           this.store.save(c);
         }
         await wallet.confirm(c.txHash);
-        return this.go(c, 'DONE', { pnlUsd: c.pnlUsd! - chain.transferGasUsd, txHash: undefined });
+        return this.go(c, 'DONE', { pnlUsd: c.pnlUsd! - chain.transferGasUsd, txHash: undefined, returnSentAt: Date.now() });
       }
       case 'RETURN_WITHDRAW': {
         if (c.inflight) {
@@ -349,10 +390,18 @@ export class CycleRunner {
         }
         await venue.move(chain.stable.symbol, c.quoteReceived!, 'fund');
         const free = await venue.free(chain.stable.symbol, 'fund');
-        const fee = Number.isFinite(stableNet!.withdrawFee) ? stableNet!.withdrawFee : 0;
+        let plan;
+        try {
+          plan = venue.withdrawPlan(chain.stable.symbol, c.quoteReceived!, free, stableNet!);
+        } catch (e) {
+          log.warn('stable return skipped (below withdraw minimum), funds stay on exchange', { id: c.id, err: errMsg(e) });
+          await venue.move(chain.stable.symbol, c.quoteReceived!, 'trade').catch(() => {});
+          return this.go(c, 'DONE');
+        }
         this.mark(c);
-        await venue.withdraw(chain.stable.symbol, Math.min(free, c.quoteReceived!), wallet.address, stableNet!.network).catch((e) => this.rejectIfDefinitive(c, e));
-        return this.go(c, 'DONE', { pnlUsd: c.pnlUsd! - fee });
+        await venue.withdraw(chain.stable.symbol, plan.amount, wallet.address, stableNet!.network).catch((e) => this.rejectIfDefinitive(c, e));
+        const feePaid = Math.max(0, c.quoteReceived! - plan.minReceived);
+        return this.go(c, 'DONE', { pnlUsd: c.pnlUsd! - feePaid, returnSentAt: Date.now() });
       }
     }
   }

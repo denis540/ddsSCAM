@@ -12,6 +12,7 @@ import { log, errMsg } from './core/logger.js';
 import { sleep } from './core/utils.js';
 import { loopLag } from './core/lag.js';
 import { Capital } from './core/capital.js';
+import { EquityMonitor } from './core/equity.js';
 
 async function main() {
   const cfg = loadConfig();
@@ -34,7 +35,9 @@ async function main() {
   await Promise.all(
     cfg.exchanges.map(async (id) => {
       try {
-        const v = new Venue(id, cfg.quote);
+        const mode = cfg.withdrawFeeMode[id];
+        if (mode !== undefined && !['deducted', 'extra', 'unknown'].includes(mode)) throw new Error(`withdrawFeeMode.${id} must be deducted|extra|unknown`);
+        const v = new Venue(id, cfg.quote, mode);
         await v.init();
         if (!cfg.dryRun && !v.hasKeys) throw new Error('no API keys');
         await v.refreshNetworks(cfg.assets, cfg.chains);
@@ -63,7 +66,25 @@ async function main() {
   // ── Telegram remote control
   const fmtPnl = (since: number) =>
     Object.entries(journal.summary(since)).map(([m, x]) => `${m}: ${x.n} cycles, pnl ${x.pnl.toFixed(2)}$, win ${x.n ? ((x.wins / x.n) * 100).toFixed(0) : 0}%`).join('\n') || 'no cycles yet';
-  notify.command('/help', () => '/status /cycles /opps /pnl /pause /resume');
+  const equity = new EquityMonitor(cfg, venues, wallets, store, journal, risk, notify);
+  equity.start();
+  notify.command('/help', () => '/status /cycles /opps /pnl /equity [reset] /resolve <id> <pnl> /pause /resume');
+  notify.command('/equity', async (args) => {
+    if (args[0] === 'reset') return `new baseline: ${(await equity.rebase()).toFixed(2)}$`;
+    const msg = await equity.check();
+    const parts = equity.last ? Object.entries(equity.last.parts).map(([k, v]) => `${k}: ${v.toFixed(2)}$`).join('\n') : '';
+    return `${msg}\n${parts}`;
+  });
+  notify.command('/resolve', (args) => {
+    if (!args[0]) return 'usage: /resolve <cycle id> <realized pnl $>   (or /resolve <id> hedgeclosed)';
+    if (args[1] === 'hedgeclosed') {
+      runner.hedgeClosed(args[0]);
+      return 'hedge marked closed; now /resolve <id> <pnl>';
+    }
+    const pnl = Number(args[1]);
+    if (!Number.isFinite(pnl)) return 'pnl must be a number, e.g. /resolve abc123 -3.5';
+    return runner.resolve(args[0], pnl);
+  });
   notify.command('/status', () =>
     [`mode: ${cfg.dryRun ? 'DRY RUN (paper)' : 'LIVE'}`, `trading: ${risk.halted ? `HALTED (${risk.haltReason})` : 'on'}`,
       `exchanges: ${[...venues.keys()].join(', ')}`, `assets: ${cfg.assets.length}`, `active cycles: ${store.active().length}, attention: ${store.attention().length}`,

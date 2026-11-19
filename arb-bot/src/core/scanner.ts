@@ -89,7 +89,10 @@ export class Scanner {
     if (!h.enabled) return undefined;
     const ok = (id: string) => {
       const v = this.venues.get(id);
-      return !!v && v.hasPerp(asset) && (this.cfg.dryRun || v.hasKeys);
+      if (!v || !v.hasPerp(asset) || !(this.cfg.dryRun || v.hasKeys)) return false;
+      // negative funding = shorts pay longs; skip venues where holding the short is expensive
+      const f = v.fundingRate8h(asset);
+      return f === undefined || f * 1e4 >= -h.maxNegFundingBps8h;
     };
     if (ok(exchange)) return exchange;
     return h.venues.find(ok);
@@ -176,7 +179,13 @@ export class Scanner {
           maxDexInWithinImpact(sell, slip) * book.asks[0][0], // DEX sell (tokens → quote)
           this.capital.capFor(Capital.cexKey(v.id)),
         );
-        trySizes(max, (q) => evalCexToDex(q, book.asks, sell, costs));
+        // tokens that arrive must cover the exchange's withdraw minimum
+        const fee = Number.isFinite(wFee) ? wFee : 0;
+        const minW = an?.withdrawMin ?? 0;
+        trySizes(max, (q) => {
+          const o = evalCexToDex(q, book.asks, sell, costs);
+          return o && o.expectedAssetMoved + fee >= minW ? o : null;
+        });
       }
       if (doD2C && canD2C && !buy.empty) {
         const max = Math.min(
@@ -184,7 +193,12 @@ export class Scanner {
           maxBaseWithinSlippage(book.bids, slip) * book.bids[0][0], // CEX sell
           this.capital.capFor(Capital.chainKey(a.chain)),
         );
-        trySizes(max, (q) => evalDexToCex(q, book.bids, buy, costs));
+        // deposits below the exchange minimum are not credited → never send them
+        const minD = an?.depositMin ?? 0;
+        trySizes(max, (q) => {
+          const o = evalDexToCex(q, book.bids, buy, costs);
+          return o && o.expectedAssetMoved >= minD ? o : null;
+        });
       }
       const best = pickBest(ops, s.minProfitUsd, s.minProfitBps);
       if (best) {
@@ -208,6 +222,14 @@ export class Scanner {
     }
     if (this.cfg.dryRun) return this.paper(c);
     if (!this.risk.canTrade()) return;
+    const att = this.runner.attentionCount();
+    if (att >= this.cfg.risk.maxAttentionCycles) {
+      if (Date.now() - (this.lastLogged.get('attention') ?? 0) > 10 * 60_000) {
+        this.lastLogged.set('attention', Date.now());
+        log.warn('new cycles blocked: cycles need manual attention (/cycles, /resolve)', { count: att });
+      }
+      return;
+    }
     const locked = this.runner.lockedAssets();
     if (locked.has(c.asset.symbol) || locked.size >= this.cfg.risk.maxConcurrentCycles) return;
     // re-check share: an earlier candidate in this same scan may have taken capital

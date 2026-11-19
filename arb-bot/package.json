@@ -13,7 +13,8 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc -p . --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "discover": "tsx src/tools/discover.ts"
+    "discover": "tsx src/tools/discover.ts",
+    "selftest": "tsx src/tools/selftest.ts"
   },
   "dependencies": {
     "ccxt": "^4.5.93",

@@ -42,6 +42,8 @@ export interface Cycle {
   hedgeOpenPx?: number;
   hedgePnlUsd?: number;
   dexSource?: string;
+  /** When stablecoins were sent back (they may still be in flight). */
+  returnSentAt?: number;
 }
 
 /** Durable cycle state: written atomically on every step so a crash/restart resumes exactly. */
