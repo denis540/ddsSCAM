@@ -40,6 +40,10 @@ export class Curve {
   get empty() {
     return this.pts.length === 0;
   }
+  range(): { minX: number; maxX: number; firstPx: number } | null {
+    const p = this.pts;
+    return p.length ? { minX: p[0].x, maxX: p[p.length - 1].x, firstPx: p[0].px } : null;
+  }
   out(x: number): number | null {
     const p = this.pts;
     if (!p.length || x <= 0) return null;
@@ -107,4 +111,69 @@ export function pickBest(ops: (Opportunity | null)[], minUsd: number, minBps: nu
   let best: Opportunity | null = null;
   for (const o of ops) if (o && o.profitUsd >= minUsd && o.profitBps >= minBps && (!best || o.profitUsd > best.profitUsd)) best = o;
   return best;
+}
+
+// ─────────── Auto-sizing by order-book slippage ───────────
+
+/** Max quote to spend on asks so the average fill stays within `slip` of the best ask. */
+export function maxQuoteWithinSlippage(asks: Level[], slip: number): number {
+  if (!asks.length) return 0;
+  const limit = asks[0][0] * (1 + slip);
+  let base = 0;
+  let cost = 0;
+  for (const [p, q] of asks) {
+    if (p <= limit) {
+      base += q;
+      cost += p * q;
+      continue;
+    }
+    // partial level: (cost + p·x) / (base + x) ≤ limit
+    const x = Math.min(q, Math.max(0, (limit * base - cost) / (p - limit)));
+    return cost + p * x;
+  }
+  return cost; // whole visible book is within slippage
+}
+
+/** Max base to sell into bids so the average fill stays within `slip` of the best bid. */
+export function maxBaseWithinSlippage(bids: Level[], slip: number): number {
+  if (!bids.length) return 0;
+  const limit = bids[0][0] * (1 - slip);
+  let base = 0;
+  let quote = 0;
+  for (const [p, q] of bids) {
+    if (p >= limit) {
+      base += q;
+      quote += p * q;
+      continue;
+    }
+    // (quote + p·x) / (base + x) ≥ limit
+    const x = Math.min(q, Math.max(0, (quote - limit * base) / (limit - p)));
+    return base + x;
+  }
+  return base;
+}
+
+/** Largest DEX input whose execution price is within `slip` of the smallest-size price. */
+export function maxDexInWithinImpact(c: Curve, slip: number): number {
+  const r = c.range();
+  if (!r) return 0;
+  const ref = r.firstPx * (1 - slip);
+  const px = (x: number) => c.out(x)! / x;
+  if (px(r.maxX) >= ref) return r.maxX;
+  let lo = r.minX;
+  let hi = r.maxX;
+  if (px(lo) < ref) return 0;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (px(mid) >= ref) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Geometric ladder: more points at small sizes where most edges live. */
+export function geoLadder(min: number, max: number, n: number): number[] {
+  if (max <= min || n <= 1) return [Math.max(min, max)];
+  const k = Math.pow(max / min, 1 / (n - 1));
+  return Array.from({ length: n }, (_, i) => min * Math.pow(k, i));
 }

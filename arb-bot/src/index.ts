@@ -11,6 +11,7 @@ import { Notifier } from './core/notifier.js';
 import { log, errMsg } from './core/logger.js';
 import { sleep } from './core/utils.js';
 import { loopLag } from './core/lag.js';
+import { Capital } from './core/capital.js';
 
 async function main() {
   const cfg = loadConfig();
@@ -54,7 +55,10 @@ async function main() {
   const journal = new Journal();
   const blacklist = new Blacklist();
   const runner = new CycleRunner(cfg, store, venues, wallets, dex, risk, notify, journal, blacklist);
-  const scanner = new Scanner(cfg, venues, wallets, dex, runner, risk, journal, blacklist);
+  const capital = new Capital(cfg, venues, wallets, store);
+  await capital.refresh(true);
+  runner.onSettled = () => void capital.refresh(true);
+  const scanner = new Scanner(cfg, venues, wallets, dex, runner, risk, journal, blacklist, capital);
 
   // ── Telegram remote control
   const fmtPnl = (since: number) =>

@@ -123,12 +123,13 @@
   ],
   "strategy": {
     "scanIntervalMs": 4000,
-    "tradeSizesQuote": [
-      100,
-      300,
-      700,
-      1500
-    ],
+    "sizing": {
+      "maxSlippageBps": 5,
+      "minTradeQuote": 20,
+      "capitalFraction": 0.5,
+      "ladderPoints": 7,
+      "paperCapitalQuote": 1000
+    },
     "minProfitUsd": 5,
     "minProfitBps": 80,
     "riskBufferBps": 40,
@@ -160,7 +161,7 @@
     "bookThrottleMs": 50
   },
   "risk": {
-    "maxConcurrentCycles": 3,
+    "maxConcurrentCycles": 2,
     "maxDailyLossUsd": 100,
     "maxConsecutiveFailures": 3,
     "transferTimeoutMin": 60,

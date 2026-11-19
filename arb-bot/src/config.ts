@@ -29,7 +29,16 @@ export interface Config {
   assets: AssetCfg[];
   strategy: {
     scanIntervalMs: number;
-    tradeSizesQuote: number[];
+    sizing: {
+      /** Max price slippage per leg (CEX order book and DEX price impact), bps. 5 = 0.05% */
+      maxSlippageBps: number;
+      minTradeQuote: number;
+      /** Fraction of a funding source's equity one cycle may use (0.5 = 50%). */
+      capitalFraction: number;
+      ladderPoints: number;
+      /** Virtual balance per source in dry run. */
+      paperCapitalQuote: number;
+    };
     minProfitUsd: number;
     minProfitBps: number;
     riskBufferBps: number;
@@ -88,6 +97,8 @@ export function loadConfig(path = process.env.CONFIG ?? 'config.json'): Config {
   }
   const st = raw.strategy;
   st.aggregators ??= ['kyber', 'odos'];
+  st.sizing = { maxSlippageBps: 5, minTradeQuote: 20, capitalFraction: 0.5, ladderPoints: 7, paperCapitalQuote: 1000, ...(st.sizing ?? {}) };
+  if (!(st.sizing.capitalFraction > 0 && st.sizing.capitalFraction <= 1)) throw new Error('sizing.capitalFraction must be in (0, 1]');
   st.probeEdgeBps ??= Math.max(0, st.minProfitBps / 2);
   st.maxAssetsParallel ??= 6;
   st.marketDataWorkers ??= true;

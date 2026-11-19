@@ -31,6 +31,8 @@ const TAX_TOLERANCE_BPS = 200;
  */
 export class CycleRunner {
   private running = new Set<string>();
+  /** Called when a cycle finishes or stops (e.g. to refresh balances). */
+  onSettled?: () => void;
 
   constructor(
     private cfg: Config,
@@ -86,6 +88,7 @@ export class CycleRunner {
       } finally {
         this.running.delete(c.id);
         if (c.step === 'DONE') this.finish(c);
+        this.onSettled?.();
       }
     })();
   }

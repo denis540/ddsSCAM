@@ -5,7 +5,11 @@ import type { DexRouter, Quote } from '../chain/aggregators.js';
 import type { CycleRunner } from './cycles.js';
 import type { RiskManager } from './risk.js';
 import type { Journal, Blacklist } from './journal.js';
-import { Curve, evalCexToDex, evalDexToCex, pickBest, walkBids, type Opportunity, type Costs } from './strategy.js';
+import {
+  Curve, evalCexToDex, evalDexToCex, pickBest, walkBids, geoLadder, maxQuoteWithinSlippage, maxBaseWithinSlippage, maxDexInWithinImpact,
+  type Opportunity, type Costs,
+} from './strategy.js';
+import { Capital } from './capital.js';
 import { log, errMsg } from './logger.js';
 import { toUnits, fromUnits } from './utils.js';
 import { loopLag } from './lag.js';
@@ -44,9 +48,11 @@ export class Scanner {
     private risk: RiskManager,
     private journal: Journal,
     private blacklist: Blacklist,
+    private capital: Capital,
   ) {}
 
   async scan() {
+    await this.capital.refresh();
     const cands: Candidate[] = [];
     const assets = this.cfg.assets.filter((a) => !this.blacklist.has(a.symbol, a.chain));
     const par = this.cfg.strategy.maxAssetsParallel;
@@ -100,9 +106,13 @@ export class Scanner {
     const bestAsk = Math.min(...[...books.values()].map((b) => b.asks[0][0]));
     const bestBid = Math.max(...[...books.values()].map((b) => b.bids[0][0]));
 
-    // ── stage 1: probe
-    const sizes = s.tradeSizesQuote;
-    const probeSize = sizes[Math.floor(sizes.length / 2)];
+    // ── stage 1: probe (small size → near-spot DEX price)
+    const z = s.sizing;
+    const slip = z.maxSlippageBps / 1e4;
+    const maxCap = this.capital.maxCap();
+    if (maxCap < z.minTradeQuote) return [];
+    const sizes = geoLadder(z.minTradeQuote, maxCap, z.ladderPoints);
+    const probeSize = z.minTradeQuote;
     const sellIn = (q: number) => toUnits(q / mid, a.decimals);
     const [pSell, pBuy] = await Promise.all([
       this.dex.quote(chain, a.address, chain.stable.address, sellIn(probeSize), { fast: true }).catch(() => null),
@@ -155,9 +165,26 @@ export class Scanner {
       const canC2D = !an || (an.withdraw && Number.isFinite(wFee));
       const canD2C = !an || an.deposit;
       const ops: (Opportunity | null)[] = [];
-      for (const q of sizes) {
-        if (doC2D && canC2D && !sell.empty) ops.push(evalCexToDex(q, book.asks, sell, costs));
-        if (doD2C && canD2C && !buy.empty) ops.push(evalDexToCex(q, book.bids, buy, costs));
+      // Size = largest amount where BOTH legs stay within maxSlippage, capped by capital share.
+      const trySizes = (max: number, fn: (q: number) => Opportunity | null) => {
+        if (max < z.minTradeQuote) return;
+        for (const q of [...sizes.filter((x) => x < max), max]) ops.push(fn(q));
+      };
+      if (doC2D && canC2D && !sell.empty) {
+        const max = Math.min(
+          maxQuoteWithinSlippage(book.asks, slip), // CEX buy
+          maxDexInWithinImpact(sell, slip) * book.asks[0][0], // DEX sell (tokens → quote)
+          this.capital.capFor(Capital.cexKey(v.id)),
+        );
+        trySizes(max, (q) => evalCexToDex(q, book.asks, sell, costs));
+      }
+      if (doD2C && canD2C && !buy.empty) {
+        const max = Math.min(
+          maxDexInWithinImpact(buy, slip), // DEX buy (stable in)
+          maxBaseWithinSlippage(book.bids, slip) * book.bids[0][0], // CEX sell
+          this.capital.capFor(Capital.chainKey(a.chain)),
+        );
+        trySizes(max, (q) => evalDexToCex(q, book.bids, buy, costs));
       }
       const best = pickBest(ops, s.minProfitUsd, s.minProfitBps);
       if (best) {
@@ -183,6 +210,9 @@ export class Scanner {
     if (!this.risk.canTrade()) return;
     const locked = this.runner.lockedAssets();
     if (locked.has(c.asset.symbol) || locked.size >= this.cfg.risk.maxConcurrentCycles) return;
+    // re-check share: an earlier candidate in this same scan may have taken capital
+    const cap = this.capital.capFor(Capital.sourceOf({ direction: c.direction, exchange: c.exchange, chain: c.asset.chain }));
+    if (c.sizeQuote > cap * 1.0001) return void log.debug('capital share taken by another cycle', { key: c.key, size: c.sizeQuote, cap });
 
     const venue = this.venues.get(c.exchange)!;
     const chain = this.cfg.chains[c.asset.chain];
